@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import re
 import threading
 import time
@@ -38,7 +37,11 @@ MEMORY_CTX_TTL = 480.0
 MAX_REPLY_CHARS = 600
 HISTORY_MAX_BYTES = 2 * 1024 * 1024
 HISTORY_RECORD_CHARS = 4000
-PLUGIN_VERSION = "1.0.0-beta"
+PLUGIN_VERSION = "1.0.0-beta.6"
+
+# 先判后答：判断在她说之前跑，所以要给一个硬上限。超时就用当前状态回答，
+# 不能因为判断慢而卡住对话——超时后那次调用自己跑完也没关系，结果直接丢掉。
+JUDGE_TIMEOUT = 15.0
 # 人设：整张卡都交给判断器，只做总长保护。
 # 挑段落等于替角色决定「哪段不重要」，换个卡（段落标题不一样）就会漏掉关键信息。
 PERSONA_BUDGET = 2000
@@ -80,9 +83,6 @@ class EmotionRuntime:
         self._last_recall_query = ""
 
         self._history_path = _history_path(getattr(store, "path", None))
-        self._queue: queue.Queue = queue.Queue(maxsize=8)
-        self._worker: threading.Thread | None = None
-        self._worker_lock = threading.Lock()
         self._closed = False
 
     # ---- 设置 / 状态 ----
@@ -169,6 +169,7 @@ class EmotionRuntime:
         turn_id = _text(request.get("current_turn_id"))
         source = _text(request.get("source")) or "chat"
 
+        should_judge = False
         with self._lock:
             state = self._state(character_id)
             self._last_character_id = character_id
@@ -176,9 +177,17 @@ class EmotionRuntime:
                 self._names[character_id] = character_name[:64]
             state.prune_pending(now)
             if source == "chat" and text and turn_id and turn_id not in state.pending:
+                # 同一个 turn_id 只判一次：先记下来，判断期间宿主再来要一次注入也不会重复跑模型。
                 state.pending[turn_id] = {"text": " ".join(text.split())[:600], "at": now}
                 state.trim_pending()
-                self._log("debug", "记下这一轮，等她回复后判断", {"turn": state.turn_count, "pending": len(state.pending)})
+                should_judge = True
+
+        # 先判后答：她说之前就把情绪定下来，然后再把此刻的状态交给提示词。
+        if should_judge:
+            self._judge_ahead(character_id, text, turn_id, now)
+
+        with self._lock:
+            state = self._state(character_id)
             content = prompt_module.build(
                 state, settings, now,
                 memory_line=self._memory_line(state, now, settings),
@@ -194,78 +203,90 @@ class EmotionRuntime:
             "required": False,
         }]
 
+    # ---- 判断 ----
+
+    def _appraise_with_timeout(self, appraiser: Any, **kwargs: Any) -> Any:
+        """模型调用放进线程里跑，超时就不等了：这一轮用当前状态回答，结果直接丢。"""
+
+        box: dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                box["verdict"] = appraiser.appraise(**kwargs)
+            except Exception as error:  # noqa: BLE001
+                box["error"] = type(error).__name__
+                box["verdict"] = None
+
+        thread = threading.Thread(target=run, name="emotion-pool-appraise", daemon=True)
+        thread.start()
+        thread.join(JUDGE_TIMEOUT)
+        if thread.is_alive():
+            self._log("warning", "先判超时，这一轮按当前情绪回答", {"timeout_s": JUDGE_TIMEOUT})
+            return None
+        if box.get("error"):
+            self._log("warning", "情绪判断失败", {"error_type": str(box["error"])})
+        return box.get("verdict")
+
     # ---- 完成事件 ----
 
     def on_chat_completed(self, payload: object) -> None:
-        try:
-            self._enqueue_completed(payload)
-        except Exception as error:  # noqa: BLE001
-            self._log("debug", "完成的对话没能进入判断队列", {"error_type": type(error).__name__})
+        """她说完了：把回复补进判断记录（判断已经在她说之前做完，这里不再跑模型）。"""
 
-    def _enqueue_completed(self, payload: object) -> None:
+        try:
+            self._attach_reply(payload)
+        except Exception as error:  # noqa: BLE001
+            self._log("debug", "回复没能补进判断记录", {"error_type": type(error).__name__})
+
+    def _attach_reply(self, payload: object) -> None:
+        """她说完了：把回复补进这一轮的判断记录（判断在她说之前已经做完，这里不再跑模型）。"""
+
         if self._closed or not isinstance(payload, Mapping):
             return
-        settings = self._settings()
-        if not settings.enabled:
-            return
         turn_id = _text(payload.get("turnId"))
-        character_id = _text(payload.get("characterId")) or "default"
         if not turn_id:
             return
         with self._lock:
-            state = self._state(character_id)
-            if turn_id not in state.pending:
-                return
-        self._ensure_worker()
-        try:
-            self._queue.put_nowait(("judge", character_id, turn_id, float(self._clock())))
-        except queue.Full:
-            self._log("debug", "判断队列已满，这一轮被跳过")
-
-    # ---- 后台线程 ----
-
-    def _ensure_worker(self) -> None:
-        with self._worker_lock:
-            if self._worker is not None and self._worker.is_alive():
-                return
-            worker = threading.Thread(target=self._worker_loop, name="emotion-pool-judge", daemon=True)
-            self._worker = worker
-            worker.start()
-
-    def _worker_loop(self) -> None:
-        while True:
-            try:
-                item = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                if self._closed:
-                    return
-                continue
-            if item is None:
-                return
-            try:
-                self._handle(item)
-            except Exception as error:  # noqa: BLE001
-                self._log("warning", "情绪判断线程出错", {"error_type": type(error).__name__})
-            finally:
-                try:
-                    self._queue.task_done()
-                except ValueError:
-                    pass
-
-    def _handle(self, item: tuple) -> None:
-        if self._closed or len(item) < 4:
+            for state in self._states().values():
+                state.pending.pop(turn_id, None)
+        reply = self._reply_text(turn_id)
+        path = self._history_path
+        if not reply or path is None or not path.is_file():
             return
-        _kind, character_id, turn_id, started_at = item
+        try:
+            if path.stat().st_size > 512 * 1024:
+                return
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        target = -1
+        for index in range(len(lines) - 1, -1, -1):
+            try:
+                item = json.loads(lines[index])
+            except ValueError:
+                continue
+            if isinstance(item, Mapping) and item.get("turn_id") == turn_id and not item.get("reply"):
+                target = index
+                break
+        if target < 0:
+            return
+        try:
+            record = json.loads(lines[target])
+            record["reply"] = reply
+            lines[target] = json.dumps(record, ensure_ascii=False, separators=(",", ":"))[:HISTORY_RECORD_CHARS]
+            temp = path.with_name(path.name + ".tmp")
+            temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            temp.replace(path)
+        except (OSError, ValueError):
+            return
+
+    def _judge_ahead(self, character_id: str, user_text: str, turn_id: str, spoken_at: float) -> None:
+        """先判后答：拿"她还没开口"的此刻去判断，判完才让提示词带上它。"""
+
         settings = self._settings()
         if not settings.enabled:
             return
         with self._lock:
             state = self._state(character_id)
-            record = state.pending.get(turn_id)
-            if not isinstance(record, Mapping):
-                return
-            user_text = str(record.get("text") or "")
-            spoken_at = float(record.get("at") or started_at)
             # 「上一轮至今」要量的是「距上一轮结束多久」，不是「这次生成了几秒」。
             # 旧写法用 spoken_at（本轮注入的时刻）做起点，于是永远算成几秒、
             # 模型看到的永远是「刚刚」——「很久没来」这条路从来没生效过。
@@ -275,14 +296,15 @@ class EmotionRuntime:
             state_line, summary = _state_lines(state)
             character_name = self._names.get(character_id, "")
         appraiser = self._appraiser
-        reply_text = self._reply_text(turn_id)
         verdict = None
         if appraiser is not None:
             try:
                 if appraiser.available():
-                    verdict = appraiser.appraise(
+                    verdict = self._appraise_with_timeout(
+                        appraiser,
                         user_text=user_text,
-                        reply_text=reply_text,
+                        # 先判后答：她还没说话，这里没有回复可读。
+                        reply_text="",
                         state_line=state_line,
                         summary=summary,
                         elapsed=_elapsed(max(0.0, gap_seconds)),
@@ -297,7 +319,8 @@ class EmotionRuntime:
         episode_snapshot = None
         with self._lock:
             state = self._state(character_id)
-            state.pending.pop(turn_id, None)
+            # 这里不清 pending：同一轮如果宿主再来要一次注入，要能认出来是同一轮。
+            # 等她说完（chat.completed）再清。
             state.turn_count += 1
             before_values = {
                 key: round(value, 4) for key, value in state.values.items() if value > 0
@@ -328,6 +351,7 @@ class EmotionRuntime:
                 self._append_history({
                     "at": now,
                     "source": "turn",
+                    "turn_id": turn_id,
                     "character": character_id,
                     "turn": state.turn_count,
                     "roster": list(verdict.roster) if verdict.roster is not None else None,
@@ -341,7 +365,8 @@ class EmotionRuntime:
                     "summary": verdict.summary,
                     "gist": verdict.gist,
                     "user": user_text,
-                    "reply": reply_text,
+                    # 她还没说话；等她说完，chat.completed 会把回复补进这一行。
+                    "reply": "",
                 })
                 self._log("info", "这一轮的情绪判断完成", {
                     "event": "emotion_pool.turn.judged",
@@ -895,13 +920,7 @@ class EmotionRuntime:
         with self._lock:
             self._closed = True
             self._save()
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            pass
-        worker = self._worker
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=2.0)
+
 
     # ---- 日志 ----
 
@@ -950,10 +969,12 @@ def _persona_excerpt(text: object, budget: int = PERSONA_BUDGET) -> str:
 
 
 def _pairs_text(values: object, limit: int = 6) -> str:
-    """把 {"委屈": 24.0} 拼成 "委屈=24,失望=10"。
+    """把 {"委屈": 24.0} 拼成 "委屈+24,失望-10"。
 
     宿主的日志净化器只接受 ASCII 键名（[A-Za-z][A-Za-z0-9_.-]*），
     直接传中文字典会被整条吃掉，日志里永远是 {}——排查时等于没有。
+    值里刻意不放 "="：这一行是 "applied=委屈+24,失望-10"，若值里再出现等号，
+    碰上按 = 切分的日志查看器会被切成 委屈 → 键名，整条记录就成非法形状了。
     """
 
     if not isinstance(values, Mapping):
@@ -966,7 +987,7 @@ def _pairs_text(values: object, limit: int = 6) -> str:
             continue
         if abs(number) < 0.01:
             continue
-        parts.append(f"{key}={number:+.0f}")
+        parts.append(f"{key}{number:+.0f}")
         if len(parts) >= max(1, int(limit)):
             break
     return ",".join(parts)[:200]

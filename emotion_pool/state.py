@@ -119,7 +119,7 @@ class Applied(dict):
 
 @dataclass
 class CharacterState:
-    """一个角色的二十一根弦。"""
+    """一个角色的二十六根弦。"""
 
     values: dict[str, float] = field(default_factory=lambda: {key: 0.0 for key in taxonomy.EMOTIONS})
     summary: str = ""

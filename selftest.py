@@ -322,12 +322,14 @@ def test_taxonomy() -> None:
         "平静", "欣慰", "期待",
         # 3.5 再补一根
         "撒娇",
+        # 3.6 再补一根
+        "兴奋",
     }
-    assert len(taxonomy.EMOTIONS) == 25, "应该是二十五种情绪"
+    assert len(taxonomy.EMOTIONS) == 26, "应该是二十六种情绪"
     assert set(taxonomy.EMOTIONS) == listed, "情绪清单必须和素材一致"
     assert all(taxonomy.spec(key).phases for key in taxonomy.EMOTIONS), "每种情绪都要有三档措辞"
     for group in (taxonomy.POSITIVE, taxonomy.NEUTRAL, taxonomy.NEGATIVE, taxonomy.MIXED):
-        assert 0 < len(group) < 25, group
+        assert 0 < len(group) < 26, group
     assert set(taxonomy.POSITIVE) | set(taxonomy.NEUTRAL) | set(taxonomy.NEGATIVE) | set(taxonomy.MIXED) == listed
     for key in taxonomy.EMOTIONS:
         assert -1.0 <= taxonomy.spec(key).valence <= 1.0, key
@@ -347,13 +349,11 @@ def test_elapsed_measures_real_gap() -> None:
 
         runtime.fragment_for(turn_request("我先去忙了", "g1"))
         runtime.on_chat_completed({"characterId": "Sakura", "turnId": "g1"})
-        runtime._queue.join()
         assert appraiser.last_elapsed == "刚刚", appraiser.last_elapsed
 
         clock.advance(3 * 3600)
         runtime.fragment_for(turn_request("我回来了", "g2"))
         runtime.on_chat_completed({"characterId": "Sakura", "turnId": "g2"})
-        runtime._queue.join()
         assert appraiser.last_elapsed == "3 小时前", f"应该是 3 小时前：{appraiser.last_elapsed}"
         runtime.close()
     finally:
@@ -499,7 +499,6 @@ def test_baseline_extracted_once() -> None:
         for turn in ("b1", "b2"):
             runtime.fragment_for(turn_request("你好", turn))
             runtime.on_chat_completed({"characterId": "Sakura", "turnId": turn})
-            runtime._queue.join()
         state = runtime._state("Sakura")
         assert state.baseline == "冷静、克制、可靠", state.baseline
         assert appraiser.baseline_calls == 1, f"只该提炼一次：{appraiser.baseline_calls}"
@@ -546,7 +545,11 @@ def test_judge_prompt_covers_taxonomy() -> None:
     assert "不要按字面直译" in appraisal_model.REBUILD_SYSTEM
     # 欣慰 / 温柔 / 撒娇 的边界
     assert "欣慰是看到他好" in appraisal_model.SYSTEM
-    assert "撒娇是直接开口要" in appraisal_model.SYSTEM
+    # 撒娇 / 傲娇 是按行为区分的两种情绪，而且互斥
+    assert "撒娇 = 行为" in appraisal_model.SYSTEM
+    assert "傲娇 = 行为" in appraisal_model.SYSTEM
+    assert "不能同时超过 40" in appraisal_model.SYSTEM
+    assert "不能同时高于 40" in appraisal_model.REBUILD_SYSTEM
     assert "不按时间衰减" in appraisal_model.SYSTEM, "总原则里要写死：不按时间衰减"
 
 
@@ -697,7 +700,8 @@ def test_log_pairs_text() -> None:
     """中文键的字典会被宿主的日志净化器丢掉，所以日志里必须打文本。"""
 
     from emotion_pool.runtime import _pairs_text
-    assert _pairs_text({"委屈": 24.0, "失望": -10.0}) == "委屈=+24,失望=-10"
+    assert _pairs_text({"委屈": 24.0, "失望": -10.0}) == "委屈+24,失望-10"
+    assert "=" not in _pairs_text({"委屈": 24.0}), "值里不能出现等号，否则日志查看器会把它当成新键"
     assert _pairs_text({"委屈": 0.0}) == ""
     assert _pairs_text(None) == ""
 
@@ -760,9 +764,7 @@ def test_turn_dedupe() -> None:
         state = runtime._state("Sakura")
         assert list(state.pending) == ["same-turn"], state.pending
         runtime.on_chat_completed({"characterId": "Sakura", "turnId": "same-turn"})
-        runtime._queue.join()
         runtime.on_chat_completed({"characterId": "Sakura", "turnId": "same-turn"})
-        runtime._queue.join()
         assert appraiser.calls == 1, f"同一轮只能判断一次，实际 {appraiser.calls}"
         assert abs(state.values["委屈"] - 0.20) < 1e-6, state.values
         assert not state.pending, "判断完要把待判断的轮次清掉"
@@ -789,7 +791,6 @@ def test_judge_applies_and_records() -> None:
                                settings={"memory_mode": "write"})
         runtime.fragment_for(turn_request("说好今天陪我的，结果又要出门", "j1"))
         runtime.on_chat_completed({"characterId": "Sakura", "turnId": "j1"})
-        runtime._queue.join()
         state = runtime._state("Sakura")
         assert abs(state.values["委屈"] - 0.24) < 1e-6, state.values
         assert abs(state.values["失望"] - 0.10) < 1e-6, state.values
@@ -813,11 +814,44 @@ def test_no_model_freezes() -> None:
         runtime = make_runtime(root, clock=clock, appraiser=None)
         runtime.fragment_for(turn_request("你真烦，滚", "n1"))
         runtime.on_chat_completed({"characterId": "Sakura", "turnId": "n1"})
-        runtime._queue.join()
         state = runtime._state("Sakura")
         assert all(value == 0.0 for value in state.values.values()), state.values
         assert state.last_judge is None
         assert state.turn_count == 1, "轮次还是要计数，只是不动情绪"
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_judge_timeout_keeps_state() -> None:
+    """先判后答要有硬上限：模型慢过 JUDGE_TIMEOUT 就不等，这一轮按当前情绪回答。"""
+
+    from emotion_pool import runtime as runtime_module
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-slow-"))
+    try:
+        clock = Clock(17_000_000.0)
+
+        class SlowAppraiser(StubAppraiser):
+            def appraise(self, **kwargs):  # noqa: ANN003
+                time.sleep(0.8)
+                return appraisal_model.ModelVerdict(deltas={"委屈": 40})
+
+        appraiser = SlowAppraiser()
+        runtime = make_runtime(root, clock=clock, appraiser=appraiser)
+        saved = runtime_module.JUDGE_TIMEOUT
+        runtime_module.JUDGE_TIMEOUT = 0.15
+        try:
+            started = time.monotonic()
+            fragments = runtime.fragment_for(turn_request("你说好今天陪我的", "slow1"))
+            consumed = time.monotonic() - started
+        finally:
+            runtime_module.JUDGE_TIMEOUT = saved
+        assert consumed < 0.6, f"超时了就该立刻放行，实际等了 {consumed:.2f}s"
+        state = runtime._state("Sakura")
+        assert all(value == 0.0 for value in state.values.values()), state.values
+        assert state.last_judge is None, state.last_judge
+        assert fragments and fragments[0]["id"] == "emotion_state", "超时也要有注入（用当前状态）"
         runtime.close()
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -1036,7 +1070,6 @@ def test_export_log_needs_confirmation() -> None:
         ]
         instance._fragments(turn_request("我回来了", "x1"))
         instance._on_chat_completed({"characterId": "Sakura", "turnId": "x1"})
-        runtime._queue.join()
 
         second = instance._action_export_log({})
         assert "已导出" in second["message"], second
@@ -1074,10 +1107,11 @@ def test_plugin_end_to_end() -> None:
         ]
         instance._fragments(turn_request("说好今天陪我的，结果又要出门", "e2e"))
         state = runtime._state("Sakura")
-        assert not state.values["委屈"], "判断之前不该凭空有情绪"
-        instance._on_chat_completed({"characterId": "Sakura", "turnId": "e2e"})
-        runtime._queue.join()
+        # 先判后答：拿到注入的时候情绪已经定了，不再是「先回完再判」
         assert abs(state.values["委屈"] - 0.32) < 1e-6, state.values
+        assert state.summary == "被放了鸽子，堵着", state.summary
+        instance._on_chat_completed({"characterId": "Sakura", "turnId": "e2e"})
+        assert not state.pending, "她开口之后要清掉待判断标记"
         payload = instance._load_dashboard()["payload"]
         assert set(payload) == {"slots", "others", "baseline", "updated", "turns"}, payload
         assert len(payload["others"]) == len(taxonomy.EMOTIONS) - len(payload["slots"]), payload
@@ -1119,7 +1153,7 @@ def test_dashboard_module() -> None:
         # 只有三个位置：心境、headline、强弱标签一律不给——让她在对话里被感受，不在面板上被描述
         assert set(payload) == {"slots", "others", "baseline", "updated", "turns"}, payload
         assert payload["slots"] == [], "平静时三个位置都是空的"
-        assert len(payload["others"]) == 25, "平静时全部二十五种都收在抽屉里"
+        assert len(payload["others"]) == 26, "平静时全部二十六种都收在抽屉里"
         assert all(item["value"] == 0 for item in payload["others"]), payload["others"]
         runtime._state("Sakura").apply_mood(["失望", "委屈"], {"失望": 43, "委屈": 12})
         payload = instance._load_dashboard()["payload"]
@@ -1202,7 +1236,6 @@ def test_long_session_stability() -> None:
             elapsed = time.perf_counter() - started
             assert elapsed < 0.5, f"第 {index} 轮太慢：{elapsed * 1000:.0f}ms"
             clock.advance(120)
-            runtime._queue.join()
         state = runtime._state("Sakura")
         assert all(0.0 <= value <= 1.0 for value in state.values.values()), state.values
         assert 0 < len(state.episodes) <= settings_module.MAX_EPISODES, len(state.episodes)
@@ -1217,7 +1250,7 @@ def main() -> int:
     print("情绪池自检（v3 · 主·次·辅 · 轮驱动）")
     print("=" * 60)
     cases = [
-        ("情绪清单：二十一种", test_taxonomy),
+        ("情绪清单：二十六种", test_taxonomy),
         ("判定提示词覆盖每一种", test_judge_prompt_covers_taxonomy),
         ("提示词：主·次·辅", test_mood_roles),
         ("判断：上一轮至今量对了", test_elapsed_measures_real_gap),
@@ -1243,6 +1276,7 @@ def main() -> int:
         ("轮次：同一轮只判断一次", test_turn_dedupe),
         ("判断：应用并记录", test_judge_applies_and_records),
         ("判断：没有模型就冻住", test_no_model_freezes),
+        ("判断：先判超时不卡对话", test_judge_timeout_keeps_state),
         ("刷新：补轮次、不清零", test_refresh_uses_model),
         ("解析：百分比与截断", test_model_parse),
         ("设置：坏值归一、旧参数已删", test_settings_parse),
