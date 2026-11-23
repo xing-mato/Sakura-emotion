@@ -189,6 +189,7 @@ class EmotionPoolPlugin:
                     "peek": self._action_dashboard_peek,
                     "reset": self._action_reset,
                     "export_log": self._action_export_log,
+                    "export_json": self._action_export_json,
                 },
             )
         except Exception as error:  # noqa: BLE001
@@ -264,6 +265,12 @@ class EmotionPoolPlugin:
         runtime = self.runtime
         if runtime is None:
             return {"message": "插件尚未就绪"}
+        # 重判是把情绪整个推倒重算，数值会跳得很大。只在她此刻没有情绪的时候开放。
+        try:
+            if runtime.dashboard_payload().get("slots"):
+                return {"message": "此刻她有情绪，不重算。等面板空了，或先清零，再来刷新。"}
+        except Exception as error:  # noqa: BLE001
+            _warn(self._logger, "刷新前读取面板失败", error)
         try:
             result = runtime.refresh_with_model()
             message = str(result.get("message") or "已刷新")
@@ -332,7 +339,14 @@ class EmotionPoolPlugin:
             return {"message": "插件尚未就绪"}
         # 确认由仪表盘页面里的对话框负责（宿主不给设置页按钮弹窗）。
         _info(self._logger, "仪表盘清零：已执行")
-        return {"message": runtime.reset()[:ACTION_MESSAGE_LIMIT]}
+        message = runtime.reset()[:ACTION_MESSAGE_LIMIT]
+        # 把清零后的面板数据一起带回去：不然前端要等下一次轮询（8 秒）才变，
+        # 看起来就像"按了没反应"，于是会连按。
+        try:
+            return {"message": message, "values": {"payload": runtime.dashboard_payload()}}
+        except Exception as error:  # noqa: BLE001
+            _warn(self._logger, "清零后读取面板失败", error)
+            return {"message": message}
 
     def _action_export_log(self, values: object) -> dict[str, Any]:
         """导出运行日志：第一次点只提醒一次隐私，60 秒内再点一次才写文件。"""
@@ -353,6 +367,28 @@ class EmotionPoolPlugin:
             return {"message": ("文件没写出来：" + str(path))[-ACTION_MESSAGE_LIMIT:]}
         opened = _open_file(path)
         return {"message": (("已导出：" if opened else "已导出但没能打开：") + name)[:ACTION_MESSAGE_LIMIT]}
+
+    def _action_export_json(self, values: object) -> dict[str, Any]:
+        return self._export_payload("jsonl")
+
+    def _export_payload(self, fmt: str) -> dict[str, Any]:
+        """把导出内容交给前端，由它弹保存对话框写盘——宿主没提供保存框。"""
+
+        runtime = self.runtime
+        if runtime is None:
+            return {"ok": False, "message": "插件尚未就绪"}
+        try:
+            name, text = runtime.export_text(fmt)
+        except Exception as error:  # noqa: BLE001
+            _warn(self._logger, "运行日志导出失败", error)
+            return {"ok": False, "message": "导出失败：" + type(error).__name__}
+        _info(self._logger, "导出运行日志：内容已生成", {"format": fmt, "chars": len(text)})
+        # 宿主只允许 values / message / applicationState 三个键，而且 values 里的键
+        # 必须是声明过的字段——所以内容走 "export" 字段回去，不能直接塞 text。
+        return {
+            "message": f"导出内容已生成（{fmt}，{len(text)} 字）"[:240],
+            "values": {"export": {"ok": True, "filename": name, "format": fmt, "chars": len(text), "text": text}},
+        }
 
     def _action_test_memory(self, values: object) -> dict[str, Any]:
         runtime = self.runtime

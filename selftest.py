@@ -217,9 +217,21 @@ class Clock:
         self.now += float(seconds)
 
 
+def wait_for(predicate, timeout: float = 3.0) -> bool:
+    """等异步线程跑完：轮询，别用固定 sleep 赌运气。"""
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
 def make_runtime(root: Path, *, clock: Clock, settings: dict | None = None,
                  timeline=None, appraiser=None, memory=None, character="Sakura",
-                 persona: str = "她冷静克制，不喜欢撒娇，说话公事公办。") -> EmotionRuntime:
+                 persona: str = "她冷静克制，不喜欢撒娇，说话公事公办。",
+                 samples: int = 1) -> EmotionRuntime:
     store = StateStore(root / "state.json", logger=FakeLogger())
     values = dict(settings or {})
     return EmotionRuntime(
@@ -232,6 +244,7 @@ def make_runtime(root: Path, *, clock: Clock, settings: dict | None = None,
         character_provider=lambda: character,
         persona_provider=lambda: persona,
         clock=clock,
+        samples=samples,
     )
 
 
@@ -257,6 +270,11 @@ class StubAppraiser:
         self.calls = 0
         self.rebuild_calls = 0
         self.baseline_calls = 0
+        self.recheck_calls = 0
+        self.recheck_verdict = None
+        self.last_track: list[str] = []
+        self.last_segments: list[dict] = []
+        self.last_recheck_state = ""
         self.baseline_text = "冷静、克制、可靠"
         self.last_history = ""
         self.last_state_line = ""
@@ -279,6 +297,14 @@ class StubAppraiser:
     def baseline(self, *, persona="", character_name=""):
         self.baseline_calls += 1
         return self.baseline_text
+
+    def recheck(self, *, user_text, reply_segments, state_line="", summary="", elapsed="",
+                character_name="", persona=""):
+        self.recheck_calls += 1
+        self.last_track = [str(item.get("tone") or "") for item in reply_segments]
+        self.last_segments = [dict(item) for item in reply_segments]
+        self.last_recheck_state = state_line
+        return self.recheck_verdict
 
     def rebuild(self, *, history, state_line="", summary="", character_name="", persona=""):
         self.rebuild_calls += 1
@@ -390,13 +416,21 @@ def test_persona_block_not_reclipped() -> None:
 
 
 def test_ghost_value_cleared() -> None:
-    """低于 5% 的弦不进面板也不进提示词，就不该占着名额。"""
+    """保留线 1%、表现线 5%：1~5% 活在余韵里，<1% 才是幽灵。"""
 
     state = state_module.CharacterState()
     state.apply_mood(["委屈"], {"委屈": 3})
-    assert state.values["委屈"] == 0.0, "3% 低于在场线，应当清零"
+    assert abs(state.values["委屈"] - 0.03) < 1e-6, "3% 不算幽灵，留在余韵里"
+    described = state_module.describe(state)
+    assert described["slots"] == [], "但 3% 不够表现，主次辅应该是空的"
+    assert [item["key"] for item in described["residual"]] == ["委屈"], described["residual"]
+
+    state.apply_mood(None, {"委屈": -2.5})
+    assert state.values["委屈"] == 0.0, "掉到 1% 以下才算幽灵，清零"
+
     state.apply_mood(["委屈"], {"委屈": 6})
-    assert abs(state.values["委屈"] - 0.06) < 1e-6, "6% 在场"
+    assert abs(state.values["委屈"] - 0.06) < 1e-6, "6% 过表现线"
+    assert state_module.describe(state)["slots"][0]["key"] == "委屈"
 
 
 def test_episode_records_drop() -> None:
@@ -549,6 +583,7 @@ def test_judge_prompt_covers_taxonomy() -> None:
     assert "撒娇 = 行为" in appraisal_model.SYSTEM
     assert "傲娇 = 行为" in appraisal_model.SYSTEM
     assert "不能同时超过 40" in appraisal_model.SYSTEM
+    assert "85 以上" in appraisal_model.SYSTEM and "85 以上" in appraisal_model.RECHECK_SYSTEM, "高位要收"
     assert "不能同时高于 40" in appraisal_model.REBUILD_SYSTEM
     assert "不按时间衰减" in appraisal_model.SYSTEM, "总原则里要写死：不按时间衰减"
 
@@ -671,6 +706,21 @@ def test_prompt_calm() -> None:
     assert "没有哪根弦" in text, text
     status = prompt.status_now(state)
     assert status["state"] == "neutral", status
+
+
+def test_status_last_shows_landed_change() -> None:
+    """状态行要写"真正落地"的变化：低于在场线被清零的增减不能写进去。"""
+
+    state = state_module.CharacterState()
+    state.last_judge = {"at": 100.0, "deltas": {"无奈": 6, "担忧": 4},
+                        "applied": {"无奈": 6}, "evicted": [], "summary": "夜里守着"}
+    status = prompt.status_last(state, 200.0)
+    assert "无奈 +6" in status["label"], status
+    assert "担忧" not in status["label"], status
+
+    state.last_judge = {"at": 100.0, "deltas": {"担忧": 4}, "applied": {}, "evicted": [], "summary": "x"}
+    status = prompt.status_last(state, 200.0)
+    assert "5%" in status["label"], status["label"]
 
 
 def test_status_last_shows_refresh_change() -> None:
@@ -857,6 +907,342 @@ def test_judge_timeout_keeps_state() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_judge_averages_samples() -> None:
+    """先判采三份取平均：单份抖动大，平均之后稳得多。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-samples-"))
+    try:
+        clock = Clock(23_000_000.0)
+        appraiser = StubAppraiser([
+            appraisal_model.ModelVerdict(deltas={"温柔": 30, "无奈": -10}, summary="心软"),
+            appraisal_model.ModelVerdict(deltas={"温柔": 10, "无奈": 10}, summary="心软"),
+            appraisal_model.ModelVerdict(deltas={"温柔": 20}, summary="被打动了"),
+        ])
+        runtime = make_runtime(root, clock=clock, appraiser=appraiser, samples=3)
+        runtime.fragment_for(turn_request("我回来了", "avg1"))
+        state = runtime._state("Sakura")
+        assert appraiser.calls == 3, appraiser.calls
+        assert abs(state.values["温柔"] - 0.20) < 1e-6, state.values     # (30+10+20)/3
+        assert state.values["无奈"] == 0.0, "均值为 0 的情绪不该留下"
+        assert state.summary == "心软", state.summary                    # 出现最多的那句
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_export_action_takes_no_values() -> None:
+    """导出只有一个动作、不收参数：宿主的设置动作只认可编辑字段，传参会被拒。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-export-actions-"))
+    try:
+        import plugin as plugin_module
+        context = FakeContext(root)
+        instance = plugin_module.EmotionPoolPlugin()
+        instance.setup(context)
+        runtime = instance.runtime
+        runtime._state("Sakura").apply_mood(["温柔"], {"温柔": 20})
+
+        result = instance._action_export_json({})
+        assert set(result) <= {"values", "message", "applicationState"}, "宿主的动作响应只认这三个键"
+        exported = result["values"]["export"]
+        assert exported["ok"] is True, exported
+        assert exported["filename"].endswith(".jsonl"), exported["filename"]
+        rows = [json.loads(line) for line in exported["text"].strip().splitlines()]
+        assert rows[0]["_meta"]["character"] == "Sakura", rows[0]
+        instance.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_reset_returns_payload() -> None:
+    """清零要把新数据一起返回：否则前端要等下一次轮询（8 秒），看起来像没按到。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-reset-"))
+    try:
+        import plugin as plugin_module
+        context = FakeContext(root)
+        instance = plugin_module.EmotionPoolPlugin()
+        instance.setup(context)
+        runtime = instance.runtime
+        runtime._state("Sakura").apply_mood(["委屈"], {"委屈": 40})
+        assert runtime.dashboard_payload()["slots"], "先得有情绪"
+        result = instance._action_reset({})
+        assert "归零" in result["message"], result
+        payload = (result.get("values") or {}).get("payload")
+        assert isinstance(payload, dict), result
+        assert payload["slots"] == [], payload
+        assert payload["turns"] == 0 or isinstance(payload["turns"], int), payload
+        instance.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_recheck_uses_her_segments() -> None:
+    """她说完之后按分段语气校正一次：先判是猜的，校正才是结算。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-recheck-"))
+    try:
+        clock = Clock(21_000_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "r1", "kind": "human", "payload": {"text": "我也不是机器吧，但和樱酱聊过天我肯定会记得的啦"}},
+            # 宿主给的是 ja/zh，时间线里换成 text —— 两种都要能吃
+            {"turnId": "r1", "kind": "assistant", "payload": {"segments": [
+                {"text": "……嗯。", "tone": "中性"},
+                {"text": "刚才那句，让我有点高兴。", "tone": "害羞"},
+                {"text": "不过，可别只是嘴上说说。", "tone": "不满"},
+            ]}},
+        ]
+        appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 6}, summary="先判")])
+        appraiser.recheck_verdict = appraisal_model.ModelVerdict(
+            deltas={"温柔": 4, "害羞": 14, "无奈": -18},
+            summary="说了会记得，高兴又要装作不在乎",
+            gist="第2段明显高兴，第3段是嘴上的警告",
+        )
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("我也不是机器吧，但和樱酱聊过天我肯定会记得的啦", "r1"))
+        state = runtime._state("Sakura")
+        assert abs(state.values["温柔"] - 0.06) < 1e-6, state.values
+
+        runtime.on_chat_completed({"characterId": "Sakura", "turnId": "r1"})
+        assert wait_for(lambda: appraiser.recheck_calls == 1), "应该跑一次校正"
+        assert wait_for(lambda: (state.last_judge or {}).get("rechecked") is True), state.last_judge
+        assert abs(state.values["害羞"] - 0.14) < 1e-6, state.values
+        assert abs(state.values["温柔"] - 0.10) < 1e-6, state.values
+        assert appraiser.last_track == ["中性", "害羞", "不满"], appraiser.last_track
+        assert all(item.get("text") for item in appraiser.last_segments), "校正必须看得到她的台词，不能只有语气"
+        assert (state.last_judge or {}).get("track") == ["中性", "害羞", "不满"], state.last_judge
+        rows = [json.loads(line) for line in (root / "history.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert any(row.get("source") == "recheck" for row in rows), rows
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def state_last(runtime):
+    return runtime._state("Sakura").last_judge
+
+
+def test_recheck_failure_is_marked() -> None:
+    """校正拿不到结果时，面板要能说「未校正」，而不是假装校过。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-recheckfail-"))
+    try:
+        clock = Clock(21_800_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "f1", "kind": "human", "payload": {"text": "在吗"}},
+            {"turnId": "f1", "kind": "assistant", "payload": {"segments": [
+                {"ja": "はい。", "zh": "在。", "tone": "中性"},
+                {"ja": "どうしましたか。", "zh": "怎么了？", "tone": "请求"},
+            ]}},
+        ]
+        appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 10})])
+        appraiser.recheck_verdict = None          # 模型这次没给出结果
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("在吗", "f1"))
+        runtime.on_chat_completed({"characterId": "Sakura", "turnId": "f1"})
+        assert wait_for(lambda: appraiser.recheck_calls == 1), appraiser.recheck_calls
+        assert wait_for(lambda: (state_last(runtime) or {}).get("rechecked") is True), state_last(runtime)
+        assert runtime.dashboard_payload()["recheck_failed"] is True
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_dashboard_shows_settled_values() -> None:
+    """面板只显示结算后的值：先判的中间态不许先在面板上跳一下。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-settled-"))
+    try:
+        clock = Clock(22_000_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "d1", "kind": "human", "payload": {"text": "我说了会记得"}},
+            {"turnId": "d1", "kind": "assistant", "payload": {"segments": [
+                {"ja": "……うん。", "zh": "……嗯。", "tone": "中性"},
+                {"ja": "……嬉しかった。", "zh": "……有点高兴。", "tone": "害羞"},
+            ]}},
+        ]
+        appraiser = StubAppraiser([
+            appraisal_model.ModelVerdict(deltas={"温柔": 6}),
+            appraisal_model.ModelVerdict(deltas={"担忧": 20}),
+        ])
+        appraiser.recheck_verdict = appraisal_model.ModelVerdict(deltas={"温柔": 4, "害羞": 14})
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+
+        runtime.fragment_for(turn_request("我说了会记得", "d1"))
+        assert runtime.dashboard_payload()["slots"][0]["key"] == "温柔", "第一次没有旧结算值，就先显示当前"
+
+        runtime.on_chat_completed({"characterId": "Sakura", "turnId": "d1"})
+        assert wait_for(lambda: (state_last(runtime) or {}).get("rechecked") is True), state_last(runtime)
+        settled = runtime.dashboard_payload()
+        assert [item["key"] for item in settled["slots"]][:2] == ["害羞", "温柔"], settled["slots"]
+        assert settled["slots"][0]["value"] == 14, settled["slots"]
+
+        # 下一轮先判（担忧 +20）之后，面板仍显示上一轮结算的样子，并标明校正中
+        runtime.fragment_for(turn_request("还在忙吗", "d2"))
+        pending = runtime.dashboard_payload()
+        assert [item["key"] for item in pending["slots"]][:2] == ["害羞", "温柔"], pending["slots"]
+        assert "校正中" in pending["updated"], pending["updated"]
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_recheck_skips_single_segment() -> None:
+    """只有一段的回复不校正——没东西可校，别浪费一次调用。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-recheck1-"))
+    try:
+        clock = Clock(21_500_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "s1", "kind": "human", "payload": {"text": "我回来了"}},
+            {"turnId": "s1", "kind": "assistant", "payload": {"segments": [
+                {"ja": "おかえり。", "zh": "欢迎回来。", "tone": "中性"},
+            ]}},
+        ]
+        appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 10})])
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("我回来了", "s1"))
+        runtime.on_chat_completed({"characterId": "Sakura", "turnId": "s1"})
+        time.sleep(0.2)
+        assert appraiser.recheck_calls == 0, "只有一段，不该校正"
+        assert (state_last(runtime) or {}).get("rechecked") is True, "跳过也要收尾，别让面板一直写「等她说完」"
+        assert runtime.dashboard_payload()["recheck_failed"] is False
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_persona_is_per_character() -> None:
+    """换角色之后判断必须用新角色的人设，不能端着上一个角色的卡继续判。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-persona-"))
+    try:
+        clock = Clock(15_500_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "q1", "kind": "human", "payload": {"text": "你好"}},
+            {"turnId": "q1", "kind": "assistant", "payload": {"segments": [{"text": "……うん。"}]}},
+        ]
+        appraiser = StubAppraiser([
+            appraisal_model.ModelVerdict(deltas={"平静": 10}),
+            appraisal_model.ModelVerdict(deltas={"自信": 10}),
+        ])
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser,
+                               persona="她冷静克制，不喜欢撒娇。")
+        runtime.fragment_for(turn_request("你好", "q1", character="Sakura"))
+        assert "不喜欢撒娇" in appraiser.last_persona, appraiser.last_persona
+        # 切角色：同一个插件进程，人设换成 N.A.V.I. 的
+        runtime._persona_provider = lambda: "N.A.V.I.，说话简短，像一台机器。"
+        runtime.fragment_for(turn_request("在吗", "q2", character="N.A.V.I."))
+        assert "N.A.V.I." in appraiser.last_persona, f"换了角色还在用旧人设：{appraiser.last_persona!r}"
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_export_text_formats() -> None:
+    """导出：只导当前角色；txt 给人看，jsonl 给机器读。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-export-"))
+    try:
+        clock = Clock(15_800_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "e1", "kind": "human", "payload": {"text": "我回来了"}},
+            {"turnId": "e1", "kind": "assistant", "payload": {"segments": [{"text": "おかえり。"}]}},
+        ]
+        appraiser = StubAppraiser([
+            appraisal_model.ModelVerdict(deltas={"温柔": 20}, summary="有点暖"),
+            appraisal_model.ModelVerdict(deltas={"平静": 10}),
+        ])
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("我回来了", "e1", character="Sakura"))
+        runtime.fragment_for(turn_request("在吗", "e2", character="N.A.V.I."))
+
+        name, text = runtime.export_text("txt")
+        assert name.endswith(".txt") and name.startswith("emotion-pool-Sakura-"), name
+        assert "角色：Sakura" in text, text[:200]
+        assert "（e1）" in text, "每条要带 turn_id，不然对不上原始记录"
+        assert "e2" not in text, "别的角色的记录不许混进来"
+
+        name, data = runtime.export_text("jsonl")
+        assert name.endswith(".jsonl"), name
+        rows = [json.loads(line) for line in data.strip().splitlines()]
+        assert rows[0]["_meta"]["character"] == "Sakura", rows[0]
+        assert rows[0]["_meta"]["records"] == 1, rows[0]
+        assert len(rows) == 2, "一行元信息 + 一条记录"
+        assert rows[1]["turn_id"] == "e1" and rows[1]["applied"], rows[1]
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_chat_cleared_resets_emotion() -> None:
+    """聊天记录没了，情绪也要跟着清——不然她会带着一段不存在的对话继续说话。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-sync-"))
+    try:
+        clock = Clock(18_000_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "s1", "kind": "human", "payload": {"text": "navi有什么好想法吗"}},
+            {"turnId": "s1", "kind": "assistant", "payload": {"segments": [{"text": "……例の件ね。"}]}},
+        ]
+        appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"平静": 10, "自信": 6})])
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("navi有什么好想法吗", "s1"))
+        state = runtime._state("Sakura")
+        assert abs(state.values["平静"] - 0.10) < 1e-6, state.values
+
+        timeline.entries = []          # 玩家把聊天记录清了
+
+        # 面板是轮询的：第一次读空只记账，第二次对得上才清（防瞬时读空误伤）
+        clock.advance(120)
+        runtime.dashboard_payload()
+        assert abs(state.values["平静"] - 0.10) < 1e-6, "第一次读到空，先别动"
+        clock.advance(10)
+        payload = runtime.dashboard_payload()
+        assert payload["slots"] == [], payload["slots"]
+        assert payload["turns"] == 0, payload
+        assert all(value == 0.0 for value in state.values.values()), state.values
+        assert state.summary == "" and state.last_judge is None and not state.episodes
+
+        # 下一句从零开始：判断器看到的「她此刻」是空的
+        runtime.fragment_for(turn_request("在吗", "s2"))
+        assert appraiser.last_state_line == "", appraiser.last_state_line
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_chat_present_keeps_emotion() -> None:
+    """对话还在的时候不许动情绪——这条是防误伤的。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-keep-"))
+    try:
+        clock = Clock(19_000_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "k1", "kind": "human", "payload": {"text": "我回来了"}},
+            {"turnId": "k1", "kind": "assistant", "payload": {"segments": [{"text": "おかえり。"}]}},
+        ]
+        appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 20})])
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("我回来了", "k1"))
+        state = runtime._state("Sakura")
+        assert abs(state.values["温柔"] - 0.20) < 1e-6, state.values
+        clock.advance(3600)
+        runtime.dashboard_payload()
+        assert abs(state.values["温柔"] - 0.20) < 1e-6, "对话还在，情绪不许被清"
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_refresh_uses_model() -> None:
     root = Path(tempfile.mkdtemp(prefix="emotion-pool-refresh-"))
     try:
@@ -1002,7 +1388,7 @@ def test_descriptors() -> None:
     dash = settings_module.dashboard_descriptor(source)
     assert dash["presentation"]["component"] == "module"
     assert "export function mount" in dash["presentation"]["source"]
-    assert [field["key"] for field in dash["fields"]] == ["payload"]
+    assert [field["key"] for field in dash["fields"]] == ["payload", "export"]
 
     collection = settings_module.collection_descriptor()
     for column in collection["columns"]:
@@ -1073,11 +1459,12 @@ def test_export_log_needs_confirmation() -> None:
 
         second = instance._action_export_log({})
         assert "已导出" in second["message"], second
-        files = list(Path(root).glob("emotion-pool-log-*.txt"))
+        files = list(Path(root).glob("emotion-pool-Sakura-*.jsonl"))
         assert files, "第二次应该写出文件"
-        text = files[0].read_text(encoding="utf-8")
-        assert "逐轮判定记录" in text and "我回来了" in text, text[:200]
-        assert "有点暖" in text, "要包含当时的心境"
+        rows = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert rows[0]["_meta"]["character"] == "Sakura", rows[0]
+        assert any("我回来了" in str(item.get("user") or "") for item in rows[1:]), rows[1:]
+        assert any("有点暖" == item.get("summary") for item in rows[1:]), "要包含当时的心境"
         instance.close()
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -1113,7 +1500,7 @@ def test_plugin_end_to_end() -> None:
         instance._on_chat_completed({"characterId": "Sakura", "turnId": "e2e"})
         assert not state.pending, "她开口之后要清掉待判断标记"
         payload = instance._load_dashboard()["payload"]
-        assert set(payload) == {"slots", "others", "baseline", "updated", "turns"}, payload
+        assert set(payload) == {"slots", "others", "baseline", "updated", "turns", "track", "rechecked", "recheck_failed"}, payload
         assert len(payload["others"]) == len(taxonomy.EMOTIONS) - len(payload["slots"]), payload
         head = payload["slots"][0]
         assert head["role"] == "主" and head["key"] == "委屈" and head["value"] == 32, head
@@ -1145,16 +1532,22 @@ def test_dashboard_module() -> None:
         assert "epd-track" in descriptor["presentation"]["source"], "胶囊轨道要真的画出来"
         assert "epd-dialog" in descriptor["presentation"]["source"], "确认对话框要在仪表盘里"
         dash_ids = {a["actionId"] for a in descriptor["actions"]}
-        assert {"refresh", "peek", "reset", "export_log"} <= dash_ids, dash_ids
+        assert {"refresh", "peek", "reset", "export_log", "export_json"} <= dash_ids, dash_ids
+        assert "showSaveFilePicker" in descriptor["presentation"]["source"], "导出要弹保存对话框"
+        assert "export_json" in descriptor["presentation"]["source"]
         assert "confirmDialog" in descriptor["presentation"]["source"]
         assert "adoptedStyleSheets" in descriptor["presentation"]["source"], "CSP 下必须用构造式样式表"
 
         payload = instance._load_dashboard()["payload"]
         # 只有三个位置：心境、headline、强弱标签一律不给——让她在对话里被感受，不在面板上被描述
-        assert set(payload) == {"slots", "others", "baseline", "updated", "turns"}, payload
+        assert set(payload) == {"slots", "others", "baseline", "updated", "turns", "track", "rechecked", "recheck_failed"}, payload
         assert payload["slots"] == [], "平静时三个位置都是空的"
         assert len(payload["others"]) == 26, "平静时全部二十六种都收在抽屉里"
         assert all(item["value"] == 0 for item in payload["others"]), payload["others"]
+        context.timeline.entries = [
+            {"turnId": "d1", "kind": "human", "payload": {"text": "说好陪我的"}},
+            {"turnId": "d1", "kind": "assistant", "payload": {"segments": [{"text": "……嗯。"}]}},
+        ]
         runtime._state("Sakura").apply_mood(["失望", "委屈"], {"失望": 43, "委屈": 12})
         payload = instance._load_dashboard()["payload"]
         assert [item["role"] for item in payload["slots"]] == ["主", "次"], payload
@@ -1172,6 +1565,11 @@ def test_dashboard_module() -> None:
         ]
         stub = StubAppraiser(rebuild=appraisal_model.ModelVerdict(values={"委屈": 20}, summary="有点闷"))
         runtime._appraiser = stub
+        # 有情绪的时候不许重判：重判会把她现在的情绪整个换掉
+        blocked = instance._action_dashboard_refresh({})
+        assert "不重算" in blocked["message"], blocked
+        assert stub.rebuild_calls == 0, "被挡住时不该去问模型"
+        instance._action_reset({})          # 清零，面板空了才开放
         refreshed = instance._action_dashboard_refresh({})
         assert "委屈" in refreshed["message"], refreshed
         assert stub.rebuild_calls == 1, "刷新必须真的去问模型"
@@ -1266,6 +1664,7 @@ def main() -> int:
         ("池子：表现三根 + 余韵三根", test_mood_capacity),
         ("注入：余韵标着不表现", test_residual_not_expressed),
         ("状态行：刷新也要说清改了什么", test_status_last_shows_refresh_change),
+        ("状态行：只写落地的变化", test_status_last_shows_landed_change),
         ("日志：中文键打成文本", test_log_pairs_text),
         ("增减：稀疏与夹紧", test_apply_deltas),
         ("在场线：5%", test_calm_threshold),
@@ -1277,6 +1676,17 @@ def main() -> int:
         ("判断：应用并记录", test_judge_applies_and_records),
         ("判断：没有模型就冻住", test_no_model_freezes),
         ("判断：先判超时不卡对话", test_judge_timeout_keeps_state),
+        ("导出：一个动作、只出 JSONL", test_export_action_takes_no_values),
+        ("判断：三份采样取平均", test_judge_averages_samples),
+        ("面板：清零要带回新数据", test_reset_returns_payload),
+        ("校正：按她的分段语气结算", test_recheck_uses_her_segments),
+        ("校正：只有一段就跳过", test_recheck_skips_single_segment),
+        ("面板：只显示结算后的值", test_dashboard_shows_settled_values),
+        ("校正：失败要标出来", test_recheck_failure_is_marked),
+        ("人设：换角色就换卡", test_persona_is_per_character),
+        ("导出：txt 与 jsonl", test_export_text_formats),
+        ("情绪：聊天清空就归零", test_chat_cleared_resets_emotion),
+        ("情绪：对话还在就不动", test_chat_present_keeps_emotion),
         ("刷新：补轮次、不清零", test_refresh_uses_model),
         ("解析：百分比与截断", test_model_parse),
         ("设置：坏值归一、旧参数已删", test_settings_parse),

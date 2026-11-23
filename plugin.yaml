@@ -3,7 +3,7 @@ id: sakuratools.emotion_pool
 name: 情绪池
 author: mato
 description: 让 Sakura 有会自己变化的情绪：从二十六种情绪里挑出「主·次·辅」三根表现出来，另外三根留作不表现的余韵；每轮她说完话由模型决定谁在场、增减多少；左侧栏有独立的「情绪」页（胶囊条仪表盘）。
-version: 1.0.0-beta.6
+version: 1.0.0-beta.7
 entry: plugin:EmotionPoolPlugin
 enabled: true
 provides: []

@@ -206,6 +206,16 @@ def dashboard_descriptor(source: str) -> dict[str, Any]:
                 "description": "仪表盘读的原始数据：此刻在场的主·次·辅，收进抽屉的其余情绪，和上一次判断的时间。",
                 "default": {},
             },
+            {
+                # 导出内容走字段回传：宿主的动作响应只允许 values / message / applicationState，
+                # values 里的键又必须对得上声明过的字段，否则会被静默丢掉。
+                "key": "export",
+                "label": "导出内容",
+                "type": "data",
+                "readonly": True,
+                "description": "面板要的导出内容，不参与显示。",
+                "default": {},
+            },
         ],
         "actions": [
             {"actionId": "refresh", "label": "刷新", "danger": False,
@@ -220,6 +230,11 @@ def dashboard_descriptor(source: str) -> dict[str, Any]:
              "description": "清空当前角色的情绪值（涟漪与聊天记录保留）。面板里点会先弹确认"},
             {"actionId": "export_log", "label": "导出日志", "danger": False,
              "description": "导出当前情绪值、逐轮判定与聊天原文。面板里点会先弹隐私确认"},
+            # 面板用它们把内容拿回去，自己弹保存对话框写盘（宿主没有保存框 API）。
+            # 分成两个动作而不是传参数：宿主的设置动作只接受「可编辑字段」作为入参，
+            # 传 {"format": "jsonl"} 会直接抛 PLUGIN_SETTINGS_VALUES_INVALID。
+            {"actionId": "export_json", "label": "导出数据", "danger": False,
+             "description": "只返回 JSONL 数据，不落盘。一行一条记录，字段固定"},
         ],
     }
 

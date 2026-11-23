@@ -154,27 +154,33 @@ def status_last(character_state: state_module.CharacterState, now: float) -> dic
     if not isinstance(verdict, dict):
         return {"state": "neutral", "label": "还没有", "message": "在下一轮回复之后会出现"}
     deltas = verdict.get("deltas") if isinstance(verdict.get("deltas"), Mapping) else {}
-    ranked = sorted(
-        ((key, float(value)) for key, value in deltas.items() if key in taxonomy.EMOTIONS),
+    has_applied = isinstance(verdict.get("applied"), Mapping)
+    applied = verdict["applied"] if has_applied else {}
+    evicted = verdict.get("evicted") if isinstance(verdict.get("evicted"), list) else []
+    # 显示"真正落地"的变化，不是模型写的原始增减：
+    # 低于 5% 在场线的增减会被清零（幽灵值），写进这一行就会出现"说了 +4 面板却看不见"。
+    # 被挤出名额的那几根也不算情绪变化。
+    source_row = applied if has_applied else deltas
+    changed = sorted(
+        ((key, float(value)) for key, value in source_row.items()
+         if key in taxonomy.EMOTIONS and abs(float(value)) >= 1 and key not in evicted),
         key=lambda item: abs(item[1]),
         reverse=True,
     )
-    parts = [f"{key} {value:+.0f}" for key, value in ranked[:3] if abs(value) >= 1]
-    if not parts:
-        # 刷新给的是绝对值，没有 deltas；实际改动记在 applied 里。
-        applied = verdict.get("applied") if isinstance(verdict.get("applied"), Mapping) else {}
-        evicted = verdict.get("evicted") if isinstance(verdict.get("evicted"), list) else []
-        # 被挤出名额的那几根不是情绪变化，别写进「上一次判断」那一行
-        changed = sorted(
-            ((key, float(value)) for key, value in applied.items()
-             if key in taxonomy.EMOTIONS and abs(float(value)) >= 1 and key not in evicted),
-            key=lambda item: abs(item[1]),
-            reverse=True,
-        )
-        parts = [f"{key} {value:+.0f}" for key, value in changed[:3]]
+    parts = [f"{key} {value:+.0f}" for key, value in changed[:3]]
+    ghost = [
+        key for key, value in deltas.items()
+        if key in taxonomy.EMOTIONS and abs(float(value)) >= 1 and key not in applied
+    ]
     at = float(verdict.get("at") or 0.0)
     age = ago(now - at) if at else ""
-    label = "、".join(parts) if parts else "没有变化"
+    if parts:
+        label = "、".join(parts)
+    elif ghost:
+        # 有增减，但都低于 5% 在场线，落地时被清零了——说清楚，别让人以为是面板没刷新
+        label = f"没有变化（{len(ghost)} 根低于 5% 在场线）"
+    else:
+        label = "没有变化"
     gist = str(verdict.get("summary") or verdict.get("gist") or "").strip()
     source = "刷新" if verdict.get("source") == "refresh" else "这一轮回复"
     message = "；".join(part for part in (age, gist[:140], f"来自{source}") if part)[:240]

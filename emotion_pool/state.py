@@ -17,7 +17,11 @@ from typing import Any, Iterable, Mapping
 
 from . import taxonomy
 
-PRESENCE = 0.05          # 低于 5% 视为"不在场"
+PRESENCE = 0.05          # 表现线：低于 5% 不占主·次·辅，也不进提示词主句
+FLOOR = 0.01             # 保留线：低于 1% 才算幽灵值，清零
+# 两条线为什么要分开：余韵的定义是"有数值但不表现"，如果它和表现线同一条，
+# 余韵里就只装得下 ≥5% 的值，1~4% 的小反应会被直接抹掉——情绪就永远起不来。
+# 现在：≥5% 表现为主·次·辅；1~5% 留在余韵；<1% 清零。
 # 人的情绪结构：一根主、最多一根次、偶尔一点辅。
 # 这三根是**表现层**——她会真的用它们说话。
 #
@@ -206,9 +210,10 @@ class CharacterState:
         applied: dict[str, float] = {}
         for key in taxonomy.EMOTIONS:
             value = after.get(key, 0.0) if key in keep else 0.0
-            # 低于在场线的值既不进面板也不进提示词，留着只会占掉三个名额之一，
+            # 低于保留线的值既不进面板也不进提示词，留着只会占掉名额，
             # 形成「状态里有、界面没有、判断器也看不到」的幽灵值——直接清掉。
-            if value < PRESENCE:
+            # 1~5% 不算幽灵：它在余韵里，面板抽屉看得见。
+            if value < FLOOR:
                 value = 0.0
             self.values[key] = value
             diff = round((value - before.get(key, 0.0)) * 100.0, 2)
@@ -409,8 +414,10 @@ class CharacterState:
 def describe(state: CharacterState) -> dict[str, Any]:
     """主 / 次 / 辅 三个位置。人在某一刻通常只有一根主情绪，最多再有一根次、一点辅。"""
 
-    ranked = [(key, value) for key, value in state.ranked() if value >= PRESENCE][:MAX_TRACKED]
-    top = ranked[:MAX_MOOD]
+    ranked = [(key, value) for key, value in state.ranked() if value >= FLOOR][:MAX_TRACKED]
+    # 表现线以上才有资格当主·次·辅；1~5% 只能进余韵。
+    top = [(key, value) for key, value in ranked if value >= PRESENCE][:MAX_MOOD]
+    shown = {key for key, _value in top}
     return {
         "calm": not top,
         "slots": [
@@ -425,8 +432,8 @@ def describe(state: CharacterState) -> dict[str, Any]:
         # 余韵：有数值、但不会成为主句里的情绪，只当底色
         "residual": [
             {"key": key, "value": value, "level": state.level_of(value)}
-            for key, value in ranked[MAX_MOOD:]
-        ],
+            for key, value in ranked if key not in shown
+        ][:MAX_MOOD],
         "summary": state.summary,
     }
 
@@ -434,5 +441,5 @@ def describe(state: CharacterState) -> dict[str, Any]:
 __all__ = [
     "CharacterState", "EPISODE_MIN_DELTA", "Episode", "LEVEL_THRESHOLDS", "MAX_MOOD",
     "MAX_PERCENT", "MAX_TRACKED", "MOOD_ROLES", "PENDING_LIMIT", "PENDING_TTL", "PRESENCE",
-    "clamp_value", "describe", "percent_of",
+    "FLOOR", "clamp_value", "describe", "percent_of",
 ]

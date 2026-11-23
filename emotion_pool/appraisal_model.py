@@ -37,7 +37,9 @@ JSON_FORMAT = {"type": "json_object"}
 FRACTION_LIMIT = 1.0
 # 人设块的上限。runtime 已经按段落挑过（约 1143 字），这里只是最后一道保险——
 # 以前这里是 600，结果把「不热烈撒娇」那句又切掉了，等于改了个寂寞。
-PERSONA_LIMIT = 1400
+# 和 runtime.PERSONA_BUDGET 保持一致：两个上限不一致时，真正生效的是小的那个，
+# 前面裁多久都是白裁。放开到 20000 就表示"判断器这一侧不再截断"。
+PERSONA_LIMIT = 20000
 
 
 def _persona_block(persona: str) -> list[str]:
@@ -107,10 +109,13 @@ SYSTEM = (
     "一个人这一刻要么在要，要么在否认，不会两样都满。\n"
     "3. 情绪是连续的。她本来就在生气，对方只是说了句平常话，给 {} 或很小的负数，不要归零。\n"
     "3.1 惊讶是短情绪：上一轮它还在、这一轮又没有新的意外，降不降、降多少由你判断。\n"
-    "3.2 池子有出水口：某根已经 50 以上、这一轮却找不出任何支持它的证据，就写负数把它降下来（-10 起）。\n"
+    "3.2 情绪会退，退的依据是证据不是数值：某一根这一轮找不出任何支持它的证据，就写负数把它降下来。"
+    "降到 15 以下就算收干净了，不必一次归零——归零是名册的事。"
+    "只是挂着、这一轮根本没被拨动的，尤其要收：数值再小，挂着不动也是假的。\n"
     "3.3 名册里不要放互相打架的两根（喜悦 60 配悲伤 50），那不是复杂，是矛盾："
     "真有这种场面，选更强的那根当主，另一根放进去就是假的。\n"
     "3.4 形态：主一般 30~80，次 10~40，辅 5~20；辅不要超过主的一半。"
+    "已经 85 以上的，这一轮先写负数收一下——情绪几乎没有长期贴着天花板的时候。"
     "一根 15 的弦放进名册当辅，比把十根都写成 15 要诚实得多。\n"
     "3.5 「平静」是底噪，不是反应：这一轮真的什么都没发生时它可以当主；"
     "但只要还有别的情绪在场，主就不该是它，平静最多留在余韵里。\n"
@@ -176,6 +181,27 @@ REBUILD_SYSTEM = (
     "只输出一个 JSON 对象：\n"
     '{"roster": ["委屈", "无奈"], "values": {"委屈": 55, "无奈": 30}, '
     '"summary": "心里有点堵", "gist": "这几轮他一直很敷衍"}'
+)
+
+RECHECK_SYSTEM = (
+    "你是同一个角色情绪评估器的第二步。第一步在她开口之前跑，只看到用户的话，给了一组预估值；"
+    "现在她说了什么、每一段用什么语气，你都看得到——用这份证据去修正它。\n"
+    "她的话按段给你，每段前面的方括号里是语气标签（中性/不满/害羞/请求/惊讶……）。\n"
+    "\n"
+    "规则：\n"
+    "1. 先读轨迹：她这几段从什么变成什么。一句一句看，不要平均成一种情绪。\n"
+    "2. 段里明摆着的情绪要给足。她写着「有点高兴」，那害羞或欣慰就该涨；"
+    "她压着说「可别只是嘴上说说」，那是傲娇或者不满，不是温柔。\n"
+    "3. 段里没有的情绪要收。某一根这一轮完全没演出来，就写足够大的负数把它压到 15 以下——"
+    "允许大改，单根绝对值不超过 25。\n"
+    "4. 她的实际表达和预估值冲突时，以她的表达为准。预估值本来就是猜的。\n"
+    "5. 别把语气标签直接当情绪名：中性不等于平静，不满不等于生气，看它落在哪句话上。\n"
+    "6. 情绪涨到高处要停：某一根已经 70 以上，除非这一轮有新的、明确的证据，不要再往上加；"
+    "85 以上必须先降。主情绪一般在 30~80，一直往上涨不是深情，是失真。\n"
+    "\n"
+    "只输出一个 JSON 对象，不要多余文字：\n"
+    '{"deltas": {"害羞": 14, "无奈": -18}, "summary": "被承诺了，高兴又要装作不在乎", '
+    '"gist": "第2段明显高兴，第3段是嘴上的警告"}'
 )
 
 _EN_ALIASES = {spec.en: key for key, spec in taxonomy.EMOTION_SPECS.items()}
@@ -441,9 +467,44 @@ def build_user_prompt(
     return "\n".join(lines)
 
 
+def build_recheck_prompt(
+    *,
+    character_name: str,
+    persona: str,
+    state_line: str,
+    summary: str,
+    user_text: str,
+    reply_segments: list[Mapping[str, Any]],
+    elapsed: str = "",
+) -> str:
+    lines = [f"角色：{character_name or '她'}", *_persona_block(persona)]
+    if state_line.strip():
+        lines.append("先判之后的她：" + " ".join(state_line.split())[:200])
+    if summary.strip():
+        lines.append("先判给的心境：" + " ".join(summary.split())[:60])
+    if elapsed.strip():
+        lines.append(f"上一轮至今：{elapsed}")
+    lines.append("用户说：" + (" ".join(user_text.split())[:600] or "（没有原话）"))
+    lines.append("她说的（按段，方括号里是语气标签）：")
+    for item in reply_segments:
+        tone = " ".join(str(item.get("tone") or "中性").split())[:8] or "中性"
+        spoken = str(item.get("text") or item.get("zh") or "")
+        japanese = str(item.get("ja") or "")
+        body = spoken or japanese
+        if spoken and japanese and japanese.strip() != spoken.strip():
+            body = spoken + " ／ " + japanese
+        lines.append(f"  [{tone}] " + (" ".join(body.split())[:240] or "（这一段没有文字）"))
+    lines.append("现在给出这次修正的 JSON。")
+    return "\n".join(lines)
+
+
+REFRESH_PERSONA_LIMIT = 4000
+
+
 def build_refresh_prompt(*, history: str, state_line: str, summary: str,
                          character_name: str, persona: str = "") -> str:
-    lines = [f"角色：{character_name or '她'}", *_persona_block(persona)]
+    # 刷新要重读十六轮对话，人设只留前面一段就够——整张卡进去会把这一次调用拖到半分钟以上。
+    lines = [f"角色：{character_name or '她'}", *_persona_block(persona[:REFRESH_PERSONA_LIMIT])]
     if state_line.strip():
         lines.append("她此刻：" + " ".join(state_line.split())[:200])
     if summary.strip():
@@ -525,6 +586,29 @@ class ModelAppraiser:
         raw = (verdict.summary or "").strip() or (verdict.raw or "").strip()
         first = raw.splitlines()[0] if raw.splitlines() else ""
         return first.strip().strip("。.,，").strip('"').strip()[:40]
+
+    def recheck(
+        self,
+        *,
+        user_text: str,
+        reply_segments: list[Mapping[str, Any]],
+        state_line: str = "",
+        summary: str = "",
+        elapsed: str = "",
+        character_name: str = "",
+        persona: str = "",
+    ) -> ModelVerdict | None:
+        """第二步：她说完之后，用她实际的表达修正预估值。"""
+
+        return self._judge(
+            RECHECK_SYSTEM,
+            build_recheck_prompt(
+                character_name=character_name, persona=persona, state_line=state_line,
+                summary=summary, user_text=user_text, reply_segments=reply_segments,
+                elapsed=elapsed,
+            ),
+            "回复校正",
+        )
 
     def rebuild(
         self,

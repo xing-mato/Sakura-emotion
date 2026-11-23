@@ -37,6 +37,7 @@ const TONE = {
 const CSS = [
   ".epd{display:grid;gap:12px;font-size:13px;color:var(--sakura-text,inherit)}",
   ".epd-base{font-size:11.5px;opacity:.45;letter-spacing:.02em}",
+  ".epd-trackline{font-size:11.5px;opacity:.5;letter-spacing:.02em;margin-top:-2px}",
   ".epd-list{display:grid;gap:10px;margin:0;padding:0;list-style:none}",
   ".epd-row{display:grid;grid-template-columns:1.9em 3.2em minmax(0,1fr) 3.2em;align-items:center;gap:12px;transition:opacity .25s}",
   ".epd-row[data-empty=true]{opacity:.4}",
@@ -178,9 +179,27 @@ export function mount(context) {
   right.append(tools, refreshButton);
   foot.append(note, right);
 
-  root.append(baselineLine, list, more, foot);
+  const trackLine = document.createElement("div");
+  trackLine.className = "epd-trackline";
+  trackLine.hidden = true;
+  root.append(baselineLine, list, trackLine, more, foot);
 
   let busy = false;
+  let busySince = 0;
+  // 宿主偶尔不返回结果：busy 一旦卡住，轮询和所有按钮都会跟着停。
+  // 超过 70 秒就当那次操作已经结束。
+  function isBusy() {
+    if (!busy) return false;
+    if (Date.now() - busySince > 70000) {
+      busy = false;
+      return false;
+    }
+    return true;
+  }
+  function setBusy(value) {
+    busy = value;
+    busySince = value ? Date.now() : 0;
+  }
   let disposed = false;
   let expanded = false;
   let pollTimer = null;
@@ -271,9 +290,30 @@ export function mount(context) {
     others.hidden = !expanded;
     note.textContent = baseNoteText();
     const turns = Number(payload.turns) || 0;
+    // 她这一轮实际用了哪几种语气（先判之后没有，她说完校正完才有）
+    const track = Array.isArray(payload.track)
+      ? payload.track.filter((item) => typeof item === "string" && item)
+      : [];
+    if (track.length >= 2) {
+      trackLine.textContent = "本轮：" + track.join(" → ");
+      trackLine.hidden = false;
+    } else if (payload.recheck_failed === true && turns > 0) {
+      trackLine.textContent = "本轮：（未校正）";
+      trackLine.hidden = false;
+    } else if (turns > 0 && payload.rechecked !== true) {
+      trackLine.textContent = "本轮：等她说完再校正";
+      trackLine.hidden = false;
+    } else {
+      trackLine.textContent = "";
+      trackLine.hidden = true;
+    }
     note.title = note.textContent + (turns > 0 ? " · 已判断 " + turns + " 轮" : " · 还没按轮判断过");
     note.classList.remove("is-flash");
     refreshButton.hidden = !action;
+    // 重判会把她现在的情绪整个换掉：只在面板空着的时候给按。
+    const hasMood = slots.length > 0;
+    refreshButton.disabled = hasMood;
+    refreshButton.title = hasMood ? "此刻她有情绪，不重算。等面板空了或清零后再用。" : "";
   }
 
   function onToggle() {
@@ -337,11 +377,14 @@ export function mount(context) {
   }
 
   async function runAction(actionId, options) {
-    if (!action || busy) return;
-    busy = true;
+    if (!action || isBusy()) return;
+    setBusy(true);
     flash(options.waiting || "正在处理…");
     try {
       const result = await action(actionId, {});
+      // 宿主把新数据一起返回时直接盖上去：不然要等下一次轮询（8 秒），看起来像没生效
+      const patched = result && result.values && result.values.payload;
+      if (patched && typeof patched === "object") localPayload = patched;
       const message = result && typeof result.message === "string" ? result.message : "";
       flash(message || options.done || "已完成");
       render();
@@ -349,17 +392,73 @@ export function mount(context) {
       flash("操作失败：" + (error && error.message ? String(error.message).slice(0, 100) : "未知错误"));
       if (onError) onError(error);
     } finally {
-      busy = false;
+      setBusy(false);
     }
   }
 
   function askExport() {
     confirmDialog({
       title: "导出运行日志？",
-      body: "文件会包含当前情绪值、逐轮判定记录和聊天原文。聊天记录可能含有隐私内容，导出后请自行保管。",
-      confirmLabel: "导出",
-      onConfirm: () => runAction("export_log", { waiting: "正在导出…", done: "已导出" }),
+      body: "文件会包含当前情绪值、逐轮判定记录和聊天原文。聊天记录可能含有隐私内容，导出后请自行保管。\n" +
+            "确认后会弹出保存对话框：扩展名选 .txt 得到可读文本，选 .jsonl 得到可直接分析的数据。",
+      confirmLabel: "选择位置并导出",
+      onConfirm: () => saveExport(),
     });
+  }
+
+  function exportStamp() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, "0");
+    return String(now.getFullYear()) + pad(now.getMonth() + 1) + pad(now.getDate()) +
+      "-" + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+  }
+
+  async function saveExport() {
+    if (!action || isBusy()) return;
+    setBusy(true);
+    flash("正在导出…");
+    try {
+      const picker = typeof window.showSaveFilePicker === "function" ? window.showSaveFilePicker : null;
+      if (!picker) {
+        // 宿主不支持保存对话框：退回插件自己写进数据目录再打开。
+        const result = await action("export_log", {});
+        flash((result && result.message) || "已导出");
+        return;
+      }
+      // 只有一种格式：JSONL。先把内容生成好，文件名由插件给（带角色和时间）
+      const result = await action("export_json", {});
+      const payload = result && result.values && result.values.export;
+      if (!payload || payload.ok !== true) {
+        flash((result && result.message) || "导出失败");
+        return;
+      }
+      let handle = null;
+      try {
+        handle = await picker.call(window, {
+          suggestedName: String(payload.filename || "emotion-pool.jsonl"),
+          types: [
+            { description: "JSONL 数据", accept: { "application/jsonl": [".jsonl"] } },
+          ],
+        });
+      } catch (error) {
+        if (error && (error.name === "AbortError" || error.code === 20)) return;   // 用户取消
+        handle = null;
+      }
+      if (!handle) {
+        const fallback = await action("export_log", {});
+        flash((fallback && fallback.message) || "已导出");
+        return;
+      }
+      const writable = await handle.createWritable();
+      await writable.write(String(payload.text || ""));
+      await writable.close();
+      flash("已保存：" + handle.name);
+    } catch (error) {
+      flash("保存失败：" + (error && error.message ? String(error.message).slice(0, 90) : "未知错误"));
+      if (onError) onError(error);
+    } finally {
+      setBusy(false);
+    }
   }
 
   function askReset() {
@@ -390,8 +489,8 @@ export function mount(context) {
   }
 
   async function refresh() {
-    if (!action || busy) return;
-    busy = true;
+    if (!action || isBusy()) return;
+    setBusy(true);
     refreshButton.disabled = true;
     refreshButton.textContent = "想一想…";
     flash("正在请她重新想一想…");
@@ -407,14 +506,14 @@ export function mount(context) {
       flash("刷新失败：" + (error && error.message ? String(error.message).slice(0, 120) : "未知错误"));
       if (onError) onError(error);
     } finally {
-      busy = false;
+      setBusy(false);
       refreshButton.disabled = false;
       refreshButton.textContent = "刷新";
     }
   }
 
   async function peek() {
-    if (!action || busy || disposed) return;
+    if (!action || isBusy() || disposed) return;
     try {
       const result = await action("peek", {});
       const patched = result && result.values && result.values.payload;

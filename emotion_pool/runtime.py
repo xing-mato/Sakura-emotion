@@ -25,6 +25,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
+from . import appraisal_model
 from . import prompt as prompt_module
 from . import state as state_module
 from . import taxonomy
@@ -37,14 +38,27 @@ MEMORY_CTX_TTL = 480.0
 MAX_REPLY_CHARS = 600
 HISTORY_MAX_BYTES = 2 * 1024 * 1024
 HISTORY_RECORD_CHARS = 4000
-PLUGIN_VERSION = "1.0.0-beta.6"
+PLUGIN_VERSION = "1.0.0-beta.7"
 
 # 先判后答：判断在她说之前跑，所以要给一个硬上限。超时就用当前状态回答，
 # 不能因为判断慢而卡住对话——超时后那次调用自己跑完也没关系，结果直接丢掉。
 JUDGE_TIMEOUT = 15.0
+
+# 同一次判断并发采三份再取平均：单份采样的抖动是主要噪声，平均之后稳得多。
+# 三份是并发跑，等待时间约等于最慢的那一份，不会变成三倍。
+JUDGE_SAMPLES = 3
+
+# 判断"聊天记录还在不在"时，多久以内的状态不去碰：她可能正在这一轮说话，
+# 而一次瞬时的读取失败不该把状态抹掉。
+CHAT_SYNC_GRACE = 60.0
+
+# 后校在她说完之后跑，不占用户的等待时间，所以可以给得宽一点。
+RECHECK_TIMEOUT = 25.0
 # 人设：整张卡都交给判断器，只做总长保护。
 # 挑段落等于替角色决定「哪段不重要」，换个卡（段落标题不一样）就会漏掉关键信息。
-PERSONA_BUDGET = 2000
+# 先别截：上限放开到 20000，整张卡都能进判断器（Sakura 的卡 12k）。
+# 截断只是权宜，等跑一段时间看判断质量和延迟，再决定要不要做句子级抽取。
+PERSONA_BUDGET = 20000
 _SECTION = re.compile(r"【([^】]{1,20})】")
 
 
@@ -60,6 +74,7 @@ class EmotionRuntime:
         memory: Any = None,
         character_provider: Callable[[], str | None] | None = None,
         persona_provider: Callable[[], str] | None = None,
+        samples: int = JUDGE_SAMPLES,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._settings_provider = settings_provider
@@ -70,17 +85,22 @@ class EmotionRuntime:
         self._memory = memory
         self._character_provider = character_provider
         self._persona_provider = persona_provider
+        # 先判采样份数：默认 3（并发取平均）；离线测试用 1 保证确定性
+        self._samples = max(1, int(samples))
         self._clock = clock
 
         self._lock = threading.RLock()
         self._characters: dict[str, state_module.CharacterState] | None = None
         self._names: dict[str, str] = {}
-        self._persona_cache: tuple[str, float] = ("", 0.0)
+        # 人设按角色分开缓存：换角色必须立刻换成新角色的卡。
+        self._persona_cache: dict[str, tuple[str, float]] = {}
         self._baseline_tried: dict[str, float] = {}
         self._last_character_id = ""
         self._last_memory_write = 0.0
         self._last_memory_turn = -999
         self._last_recall_query = ""
+        # 面板是轮询的，一次读空可能只是宿主还没加载完：要两次都对得上才动手。
+        self._empty_chat_seen: dict[str, float] = {}
 
         self._history_path = _history_path(getattr(store, "path", None))
         self._closed = False
@@ -117,10 +137,15 @@ class EmotionRuntime:
         except Exception:  # noqa: BLE001
             pass
 
-    def _persona(self) -> str:
-        """她的角色设定节选：判断必须按她的性格，而不是通用陪伴逻辑。"""
+    def _persona(self, character_id: str = "") -> str:
+        """她的角色设定节选：判断必须按她的性格，而不是通用陪伴逻辑。
 
-        text, at = self._persona_cache
+        缓存按角色分开。原来是一个全局槽位、10 分钟有效——切角色后的头十分钟，
+        新角色会拿着旧角色的卡被判断，那就是人设串台。
+        """
+
+        key = character_id or "default"
+        text, at = self._persona_cache.get(key, ("", 0.0))
         if text and (self._clock() - at) < 600:
             return text
         excerpt = ""
@@ -132,7 +157,7 @@ class EmotionRuntime:
                 value = ""
             if isinstance(value, str):
                 excerpt = _persona_excerpt(value)
-        self._persona_cache = (excerpt, float(self._clock()))
+        self._persona_cache[key] = (excerpt, float(self._clock()))
         return excerpt
 
     def _current_character_id(self) -> str:
@@ -168,6 +193,9 @@ class EmotionRuntime:
         text = _text(request.get("current_input"))
         turn_id = _text(request.get("current_turn_id"))
         source = _text(request.get("source")) or "chat"
+
+        # 聊天记录被清空时，情绪一起归零——没有那段对话，就没有那段情绪留下的理由。
+        self._sync_cleared_chat(character_id)
 
         should_judge = False
         with self._lock:
@@ -205,37 +233,259 @@ class EmotionRuntime:
 
     # ---- 判断 ----
 
-    def _appraise_with_timeout(self, appraiser: Any, **kwargs: Any) -> Any:
-        """模型调用放进线程里跑，超时就不等了：这一轮用当前状态回答，结果直接丢。"""
+    def _call_with_timeout(
+        self, call: Any, kwargs: dict[str, Any], timeout: float, slow_message: str,
+    ) -> Any:
+        """模型调用放进线程里跑，超时就不等了。超时那次自己跑完也无所谓，结果直接丢。"""
 
         box: dict[str, Any] = {}
 
         def run() -> None:
             try:
-                box["verdict"] = appraiser.appraise(**kwargs)
+                box["verdict"] = call(**kwargs)
             except Exception as error:  # noqa: BLE001
                 box["error"] = type(error).__name__
                 box["verdict"] = None
 
-        thread = threading.Thread(target=run, name="emotion-pool-appraise", daemon=True)
+        thread = threading.Thread(target=run, name="emotion-pool-model", daemon=True)
         thread.start()
-        thread.join(JUDGE_TIMEOUT)
+        thread.join(timeout)
         if thread.is_alive():
-            self._log("warning", "先判超时，这一轮按当前情绪回答", {"timeout_s": JUDGE_TIMEOUT})
+            self._log("warning", slow_message, {"timeout_s": timeout})
             return None
         if box.get("error"):
             self._log("warning", "情绪判断失败", {"error_type": str(box["error"])})
         return box.get("verdict")
 
+    def _appraise_with_timeout(self, appraiser: Any, **kwargs: Any) -> Any:
+        return self._call_with_timeout(
+            appraiser.appraise, kwargs, JUDGE_TIMEOUT, "先判超时，这一轮按当前情绪回答",
+        )
+
+    def _sample_verdicts(self, appraiser: Any, kwargs: dict[str, Any], samples: int) -> Any:
+        """同一次判断并发采 N 份，取平均。比单份稳，等待时间约等于最慢的一份。"""
+
+        results: list[Any] = [None] * max(1, samples)
+
+        def run(index: int) -> None:
+            try:
+                results[index] = appraiser.appraise(**kwargs)
+            except Exception as error:  # noqa: BLE001
+                self._log("debug", "采样失败", {"error_type": type(error).__name__})
+                results[index] = None
+
+        threads = [
+            threading.Thread(target=run, args=(index,), name=f"emotion-pool-sample-{index}", daemon=True)
+            for index in range(len(results))
+        ]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + JUDGE_TIMEOUT
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        got = [item for item in results if item is not None]
+        if not got:
+            self._log("warning", "先判没有拿到结果，这一轮按当前情绪回答", {"samples": len(results)})
+            return None
+        if len(got) < len(results):
+            self._log("warning", "先判只拿到部分采样", {"got": len(got), "expected": len(results)})
+        return _average_verdicts(got)
+
     # ---- 完成事件 ----
 
     def on_chat_completed(self, payload: object) -> None:
-        """她说完了：把回复补进判断记录（判断已经在她说之前做完，这里不再跑模型）。"""
+        """她说完了：补记回复，然后按她实际的表达做一次校正。"""
 
+        try:
+            self._schedule_recheck(payload)
+        except Exception as error:  # noqa: BLE001
+            self._log("debug", "回复校正没能安排", {"error_type": type(error).__name__})
         try:
             self._attach_reply(payload)
         except Exception as error:  # noqa: BLE001
             self._log("debug", "回复没能补进判断记录", {"error_type": type(error).__name__})
+
+    def _reply_segments(self, turn_id: str) -> list[dict[str, Any]]:
+        """把她这一轮的回复拆成段（每段带语气标签）。"""
+
+        for entry in reversed(self._entries(8)):
+            if str(entry.get("kind") or "") != "assistant":
+                continue
+            if str(entry.get("turnId") or "") != turn_id:
+                continue
+            payload = entry.get("payload")
+            items = payload.get("segments") if isinstance(payload, Mapping) else None
+            if isinstance(items, list):
+                out: list[dict[str, Any]] = []
+                for item in items:
+                    if not isinstance(item, Mapping):
+                        continue
+                    # 宿主时间线里的段落文本在 "text" 上，不是 ja/zh——之前只读 ja/zh，
+                    # 校正拿到的每一段都是空的，于是模型只能看见语气标签。
+                    spoken = item.get("zh") or item.get("text") or ""
+                    out.append({
+                        "tone": str(item.get("tone") or "中性"),
+                        "text": " ".join(str(spoken).split()),
+                        "ja": " ".join(str(item.get("ja") or "").split()),
+                    })
+                return out
+        return []
+
+    def _schedule_recheck(self, payload: object) -> None:
+        """她说完之后，用她实际的表达做一次校正（异步，不占用户的等待时间）。"""
+
+        if self._closed or not isinstance(payload, Mapping):
+            return
+        if not self._settings().enabled:
+            return
+        appraiser = self._appraiser
+        if appraiser is None or not callable(getattr(appraiser, "recheck", None)):
+            return
+        turn_id = _text(payload.get("turnId"))
+        character_id = _text(payload.get("characterId")) or "default"
+        if not turn_id:
+            return
+        segments = self._reply_segments(turn_id)
+        if len(segments) < 2:
+            self._log("debug", "回复只有一段，跳过校正", {"segments": len(segments)})
+            self._settle_recheck(character_id, turn_id)
+            return
+        with self._lock:
+            state = self._state(character_id)
+            record = state.pending.get(turn_id)
+            user_text = str(record.get("text") or "") if isinstance(record, Mapping) else ""
+            last = state.last_judge if isinstance(state.last_judge, Mapping) else {}
+            judged_at = float(last.get("at") or 0.0)
+        if judged_at <= 0:
+            return
+        threading.Thread(
+            target=self._recheck,
+            args=(character_id, turn_id, user_text, judged_at, segments),
+            name="emotion-pool-recheck",
+            daemon=True,
+        ).start()
+
+    def _settle_recheck(self, character_id: str, turn_id: str, *, failed: bool = False) -> None:
+        """没有校正这一步时收尾：别让面板一直写着"等她说完再校正"。"""
+
+        with self._lock:
+            state = self._state(character_id)
+            last = state.last_judge
+            if not isinstance(last, Mapping):
+                return
+            if str(last.get("turn_id") or "") not in ("", turn_id) and turn_id:
+                return
+            updated = dict(last)
+            updated["rechecked"] = True
+            updated["recheck_failed"] = bool(failed)
+            updated.setdefault("track", [])
+            # 结算快照：面板只显示这个。没校正成时就用先判的值兜底。
+            updated["settled"] = _snapshot(state)
+            state.last_judge = updated
+            self._save()
+
+    def _recheck(
+        self, character_id: str, turn_id: str, user_text: str,
+        judged_at: float, segments: list[dict[str, Any]],
+    ) -> None:
+        try:
+            self._recheck_inner(character_id, turn_id, user_text, judged_at, segments)
+        except Exception as error:  # noqa: BLE001
+            self._log("warning", "回复校正出错，保留先判的值", {"error_type": type(error).__name__})
+
+    def _recheck_inner(
+        self, character_id: str, turn_id: str, user_text: str,
+        judged_at: float, segments: list[dict[str, Any]],
+    ) -> None:
+        appraiser = self._appraiser
+        if appraiser is None or self._closed:
+            return
+        with self._lock:
+            state = self._state(character_id)
+            last = state.last_judge if isinstance(state.last_judge, Mapping) else {}
+            if float(last.get("at") or 0.0) != judged_at:
+                # 已经有更新的一轮判过了，别拿上一轮的证据去改新状态
+                return
+            state_line, summary = _state_lines(state)
+            character_name = self._names.get(character_id, "")
+            gap = float(self._clock()) - judged_at
+        verdict = self._call_with_timeout(
+            appraiser.recheck,
+            dict(
+                user_text=user_text,
+                reply_segments=segments,
+                state_line=state_line,
+                summary=summary,
+                elapsed=_elapsed(max(0.0, gap)),
+                character_name=character_name,
+                persona=self._persona(character_id),
+            ),
+            RECHECK_TIMEOUT,
+            "校正超时，保留先判的值",
+        )
+        if verdict is None:
+            self._log("info", "回复校正没有结果，保留先判的值", {"turn": state.turn_count})
+            self._settle_recheck(character_id, turn_id, failed=True)
+            return
+        now = float(self._clock())
+        track = [" ".join(str(item.get("tone") or "中性").split())[:8] or "中性" for item in segments][:4]
+        with self._lock:
+            state = self._state(character_id)
+            last = state.last_judge if isinstance(state.last_judge, Mapping) else {}
+            if float(last.get("at") or 0.0) != judged_at:
+                return
+            applied = state.apply_mood(verdict.roster, verdict.deltas, verdict.values or None)
+            if verdict.summary:
+                state.set_summary(verdict.summary)
+            state.updated_at = now
+            top = state.top(1)
+            state.note_main(top[0][0] if top else None)
+            last = dict(state.last_judge or {})
+            last.update({
+                "rechecked": True,
+                "settled": _snapshot(state),
+                "track": track,
+                "recheck": {
+                    "at": now,
+                    "deltas": dict(verdict.deltas),
+                    "applied": {key: round(value, 1) for key, value in applied.items()},
+                    "summary": verdict.summary,
+                    "gist": verdict.gist,
+                },
+                # 「上一次判断」那一行现在显示的是校正后的数字，不是先判的预测
+                "deltas": {key: round(value, 1) for key, value in verdict.deltas.items()},
+                "applied": {key: round(value, 1) for key, value in applied.items()},
+                "evicted": list(getattr(applied, "evicted", ())),
+                "summary": verdict.summary or last.get("summary") or "",
+            })
+            state.last_judge = last
+            self._append_history({
+                "at": now,
+                "source": "recheck",
+                "turn_id": turn_id,
+                "character": character_id,
+                "turn": state.turn_count,
+                "deltas": {key: round(value, 1) for key, value in verdict.deltas.items()},
+                "applied": {key: round(value, 1) for key, value in applied.items()},
+                "evicted": list(getattr(applied, "evicted", ())),
+                "track": track,
+                "after": {
+                    key: prompt_module.percent(value)
+                    for key, value in state.top(3, floor=0.0) if value > 0
+                },
+                "summary": verdict.summary,
+                "gist": verdict.gist,
+                "user": "",
+                "reply": "",
+            })
+            self._save()
+        self._log("info", "回复校正完成", {
+            "event": "emotion_pool.turn.rechecked",
+            "turn": state.turn_count,
+            "track": ",".join(track) or "none",
+            "applied": _pairs_text(applied) or "none",
+            "summary": (verdict.summary or "")[:40],
+        })
 
     def _attach_reply(self, payload: object) -> None:
         """她说完了：把回复补进这一轮的判断记录（判断在她说之前已经做完，这里不再跑模型）。"""
@@ -300,8 +550,9 @@ class EmotionRuntime:
         if appraiser is not None:
             try:
                 if appraiser.available():
-                    verdict = self._appraise_with_timeout(
+                    verdict = self._sample_verdicts(
                         appraiser,
+                        dict(
                         user_text=user_text,
                         # 先判后答：她还没说话，这里没有回复可读。
                         reply_text="",
@@ -309,7 +560,9 @@ class EmotionRuntime:
                         summary=summary,
                         elapsed=_elapsed(max(0.0, gap_seconds)),
                         character_name=character_name,
-                        persona=self._persona(),
+                        persona=self._persona(character_id),
+                        ),
+                        self._samples,
                     )
             except Exception as error:  # noqa: BLE001
                 self._log("warning", "情绪判断失败", {"error_type": type(error).__name__})
@@ -333,8 +586,10 @@ class EmotionRuntime:
                 state.updated_at = now
                 top = state.top(1)
                 state.note_main(top[0][0] if top else None)
+                previous = state.last_judge if isinstance(state.last_judge, Mapping) else {}
                 state.last_judge = {
                     "at": now,
+                    "turn_id": turn_id,
                     "roster": list(verdict.roster) if verdict.roster is not None else None,
                     "before": before_values,   # 判断前的快照，下一轮给判断器看趋势
                     "deltas": dict(verdict.deltas),
@@ -344,6 +599,11 @@ class EmotionRuntime:
                     "summary": verdict.summary,
                     "gist": verdict.gist,
                     "source": "turn",
+                    # 先判只是预测：等她说完会有一次校正，面板据此显示"待校正/已校正"
+                    "rechecked": False,
+                    "track": [],
+                    # 上一轮结算过的样子继续留着，面板在校正完成前显示它，不跳中间态
+                    "settled": previous.get("settled"),
                 }
                 episode_snapshot = self._record_episode(
                     state, applied, verdict, settings, now, user_text, turn_id,
@@ -425,24 +685,44 @@ class EmotionRuntime:
             return []
         return rows[-max(1, int(limit)):]
 
-    def export_log(self, limit: int = 120) -> str:
-        """把当前值、逐轮判定、涟漪和聊天原文导成一个文本文件，返回路径。"""
+    def _export_records(self, character_id: str, limit: int) -> list[dict[str, Any]]:
+        """只导当前角色的记录。两个角色的判定混在一份里，等于没法分析。"""
+
+        rows = self._read_history(max(limit * 4, 400))
+        picked = [item for item in rows if str(item.get("character") or "") == character_id]
+        return picked[-max(1, int(limit)):]
+
+    def export_text(self, fmt: str = "txt", limit: int = 120) -> tuple[str, str]:
+        """生成导出内容（不落盘）：返回 (建议文件名, 文本)。fmt = txt | jsonl。"""
 
         now = float(self._clock())
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-        path = _history_path(getattr(self._store, "path", None))
-        if path is None:
-            raise RuntimeError("没有可写的数据目录")
-        target = path.with_name(f"emotion-pool-log-{stamp}.txt")
+        character_id = self._current_character_id()
+        records = self._export_records(character_id, limit)
+        safe = "".join(ch for ch in (character_id or "default") if ch.isalnum() or ch in "._-")
+        safe = safe or "default"
+        if fmt == "jsonl":
+            meta = {
+                "_meta": {
+                    "plugin": "sakuratools.emotion_pool",
+                    "version": PLUGIN_VERSION,
+                    "exported_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+                    "character": character_id,
+                    "records": len(records),
+                }
+            }
+            rows = [json.dumps(meta, ensure_ascii=False)]
+            rows.extend(json.dumps(item, ensure_ascii=False) for item in records)
+            return f"emotion-pool-{safe}-{stamp}.jsonl", "\n".join(rows) + "\n"
         with self._lock:
-            state = self._state(self._current_character_id())
+            state = self._state(character_id)
             described = state_module.describe(state)
             lines = [
                 "情绪池 · 运行日志导出",
                 "=" * 40,
                 f"生成时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}",
                 f"插件版本：{PLUGIN_VERSION}",
-                f"角色：{self._current_character_id()}",
+                f"角色：{character_id}",
                 "",
                 "【一】当前情绪",
             ]
@@ -464,14 +744,16 @@ class EmotionRuntime:
                 lines.append("底色：" + state.baseline)
             lines.append(f"判定轮次：{state.turn_count}")
             lines.extend(["", "【二】逐轮判定记录"])
-            history = self._read_history(limit)
+            history = records
             if not history:
                 lines.append("（还没有记录）")
             for item in history:
                 when = time.strftime("%m-%d %H:%M:%S", time.localtime(float(item.get("at") or 0)))
-                kind = "刷新重判" if item.get("source") == "refresh" else "逐轮判断"
+                kind = {"refresh": "刷新重判", "recheck": "回复校正"}.get(
+                    str(item.get("source") or ""), "逐轮判断")
                 lines.append("")
-                lines.append(f"{when}  {kind}  第 {item.get('turn')} 轮")
+                tid = str(item.get("turn_id") or "")[:8]
+                lines.append(f"{when}  {kind}  第 {item.get('turn')} 轮" + (f"（{tid}）" if tid else ""))
                 deltas = item.get("deltas") or {}
                 applied = item.get("applied") or {}
                 if deltas:
@@ -485,6 +767,9 @@ class EmotionRuntime:
                 after = item.get("after") or {}
                 if after:
                     lines.append("  判断后：" + "、".join(f"{k} {v}%" for k, v in after.items()))
+                track = item.get("track") or []
+                if track:
+                    lines.append("  本轮语气：" + " → ".join(str(x) for x in track))
                 if item.get("summary"):
                     lines.append("  心境：" + str(item["summary"]))
                 if item.get("gist"):
@@ -517,7 +802,17 @@ class EmotionRuntime:
             lines.append(f"{_clock_of(entry)}  {who}：{text[:300]}")
         lines.append("")
         lines.append("（本文件包含聊天原文，可能含隐私内容，请自行保管。）")
-        target.write_text("\n".join(lines), encoding="utf-8")
+        return f"emotion-pool-{safe}-{stamp}.txt", "\n".join(lines) + "\n"
+
+    def export_log(self, limit: int = 120) -> str:
+        """写到插件数据目录并返回路径——保存对话框不可用时的退路。只出 JSONL。"""
+
+        name, text = self.export_text("jsonl", limit)
+        base = _history_path(getattr(self._store, "path", None))
+        if base is None:
+            raise RuntimeError("没有可写的数据目录")
+        target = base.with_name(name)
+        target.write_text(text, encoding="utf-8")
         return str(target)
 
     def _ensure_baseline(self, character_id: str, character_name: str, appraiser: Any) -> None:
@@ -538,7 +833,7 @@ class EmotionRuntime:
                 return
             self._baseline_tried[character_id] = now
         try:
-            line = fetch(persona=self._persona(), character_name=character_name)
+            line = fetch(persona=self._persona(character_id), character_name=character_name)
         except Exception as error:  # noqa: BLE001
             self._log("debug", "性格底色没能提炼", {"error_type": type(error).__name__})
             return
@@ -611,7 +906,7 @@ class EmotionRuntime:
         try:
             verdict = appraiser.rebuild(
                 history=history, state_line=state_line, summary=summary,
-                character_name=character_name, persona=self._persona(),
+                character_name=character_name, persona=self._persona(character_id),
             )
         except Exception as error:  # noqa: BLE001
             self._log("warning", "刷新时的情绪判断失败", {"error_type": type(error).__name__})
@@ -800,6 +1095,59 @@ class EmotionRuntime:
                 fallback = text
         return (matched or fallback)[:MAX_REPLY_CHARS]
 
+    def _sync_cleared_chat(self, character_id: str, *, confirm: bool = False) -> None:
+        """聊天记录被清空时，情绪一起归零。
+
+        看的是"这段对话还在不在"，不是"过了多久"——没有那段对话，就没有那段情绪留下的理由。
+        读不到对话（服务异常、返回形状不对）一律不动手：宁可留一条旧情绪，
+        也不要在她正在说话的时候把状态抹掉。
+        """
+
+        timeline = self._timeline
+        if timeline is None:
+            return
+        now = float(self._clock())
+        with self._lock:
+            state = self._state(character_id)
+            if not state.turn_count and not state.summary and not any(state.values.values()):
+                return
+            if (now - float(state.updated_at or 0.0)) < CHAT_SYNC_GRACE:
+                return
+            before_turn = int(state.turn_count)
+        try:
+            response = timeline.read_recent({"limit": 1})
+        except Exception as error:  # noqa: BLE001
+            self._log("debug", "读取最近对话失败，情绪先不动", {"error_type": type(error).__name__})
+            return
+        entries = response.get("entries") if isinstance(response, Mapping) else None
+        if not isinstance(entries, list):
+            return
+        if entries:
+            self._empty_chat_seen.pop(character_id, None)
+            return
+        if confirm:
+            # 面板路径：要连续两次读到空才动手，免得一次瞬时读空把状态抹了。
+            seen = self._empty_chat_seen.get(character_id, 0.0)
+            if not seen or (now - seen) < 5.0:
+                self._empty_chat_seen[character_id] = now
+                return
+        self._empty_chat_seen.pop(character_id, None)
+        with self._lock:
+            state = self._state(character_id)
+            state.values = taxonomy.empty_pools()
+            state.summary = ""
+            state.main_streak = {}
+            state.last_judge = None
+            state.memory_ctx = None
+            state.pending = {}
+            state.episodes = []
+            state.turn_count = 0
+            state.updated_at = now
+            self._save()
+        self._log("info", "聊天记录已清空，情绪一起归零", {
+            "character": str(character_id)[:32], "turn": before_turn,
+        })
+
     # ---- 设置页与仪表盘 ----
 
     def dashboard_payload(self) -> dict[str, Any]:
@@ -809,9 +1157,22 @@ class EmotionRuntime:
         栏里那几根就是她此刻的全部。
         """
 
+        character_id = self._current_character_id()
+        self._sync_cleared_chat(character_id, confirm=True)
         with self._lock:
-            state = self._state(self._current_character_id())
-            described = state_module.describe(state)
+            state = self._state(character_id)
+            last = state.last_judge if isinstance(state.last_judge, Mapping) else {}
+            # 面板只显示"结算之后"的值：先判是预测，校正才是结果。
+            # 这一轮还没结算时，继续显示上一轮结算的样子，别让数值来回跳。
+            settled = last.get("settled") if isinstance(last.get("settled"), Mapping) else None
+            shown = state
+            if settled and isinstance(settled.get("values"), Mapping):
+                shown = state_module.CharacterState()
+                shown.values = {
+                    key: max(0.0, float(settled["values"].get(key, 0.0))) for key in taxonomy.EMOTIONS
+                }
+                shown.summary = str(settled.get("summary") or "")
+            described = state_module.describe(shown)
             slots = [
                 {
                     "role": item["role"],
@@ -824,25 +1185,32 @@ class EmotionRuntime:
             present = {item["key"] for item in described["slots"]}
             others = sorted(
                 (
-                    {"key": key, "value": prompt_module.percent(state.values.get(key, 0.0))}
+                    {"key": key, "value": prompt_module.percent(shown.values.get(key, 0.0))}
                     for key in taxonomy.EMOTIONS
                     if key not in present
                 ),
                 key=lambda item: -item["value"],
             )
-            last = state.last_judge if isinstance(state.last_judge, Mapping) else {}
             at = float(last.get("at") or 0.0)
-            updated = (
-                f"上一次判断：{prompt_module.ago(self._clock() - at)} · "
-                f"{prompt_module.status_last(state, self._clock())['label']}"
-                if at > 0 else "还没有判断过：等她回一轮话，或点一次刷新"
-            )
+            if at > 0 and settled and not last.get("rechecked"):
+                updated = f"校正中：{prompt_module.ago(self._clock() - at)}先判了一次，等她说完再结算"
+            elif at > 0:
+                updated = (
+                    f"上一次判断：{prompt_module.ago(self._clock() - at)} · "
+                    f"{prompt_module.status_last(state, self._clock())['label']}"
+                )
+            else:
+                updated = "还没有判断过：等她回一轮话，或点一次刷新"
             payload = {
                 "slots": slots,
                 "others": others,
                 "baseline": (state.baseline or "")[:40],
                 "updated": updated[:80],
                 "turns": int(state.turn_count),
+                # 她这一轮实际用了哪几种语气（先判 → 校正之后才有）
+                "track": [str(item)[:8] for item in (last.get("track") or [])][:4],
+                "rechecked": bool(last.get("rechecked")),
+                "recheck_failed": bool(last.get("recheck_failed")),
             }
             self._save()
         return payload
@@ -966,6 +1334,42 @@ def _persona_excerpt(text: object, budget: int = PERSONA_BUDGET) -> str:
         keep = max(80, int(len(body) * ratio))
         pieces.append(body[:keep])
     return " ".join(pieces)[:budget]
+
+
+def _average_verdicts(verdicts: list[Any]) -> Any:
+    """把几份采样平均成一份：增减取均值，心境取出现最多的那句。"""
+
+    if not verdicts:
+        return None
+    if len(verdicts) == 1:
+        return verdicts[0]
+    keys: set[str] = set()
+    for item in verdicts:
+        keys.update(getattr(item, "deltas", {}) or {})
+    deltas: dict[str, float] = {}
+    for key in keys:
+        values = [float((getattr(item, "deltas", {}) or {}).get(key, 0.0)) for item in verdicts]
+        mean = sum(values) / len(values)
+        if abs(mean) >= 1:
+            deltas[key] = round(mean, 1)
+    summaries = [str(getattr(item, "summary", "") or "") for item in verdicts]
+    summaries = [item for item in summaries if item]
+    summary = max(set(summaries), key=summaries.count) if summaries else ""
+    gists = [str(getattr(item, "gist", "") or "") for item in verdicts]
+    gist = next((item for item in gists if item), "")
+    return appraisal_model.ModelVerdict(
+        deltas=deltas, values={}, roster=None, summary=summary, gist=gist,
+    )
+
+
+def _snapshot(state: Any) -> dict[str, Any]:
+    """结算快照：面板只显示校正之后的值，不显示先判的中间态。"""
+
+    return {
+        "values": {key: round(float(value), 4) for key, value in state.values.items() if value > 0},
+        "summary": str(getattr(state, "summary", "") or ""),
+        "at": float(getattr(state, "updated_at", 0.0) or 0.0),
+    }
 
 
 def _pairs_text(values: object, limit: int = 6) -> str:
