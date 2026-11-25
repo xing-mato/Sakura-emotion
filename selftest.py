@@ -280,16 +280,18 @@ class StubAppraiser:
         self.last_state_line = ""
         self.last_persona = ""
         self.last_elapsed = ""
+        self.last_her_recent = ""
 
     def available(self) -> bool:
         return True
 
     def appraise(self, *, user_text, reply_text, state_line="", summary="", elapsed="",
-                 character_name="", persona=""):
+                 character_name="", persona="", her_recent=""):
         self.calls += 1
         self.last_state_line = state_line
         self.last_persona = persona
         self.last_elapsed = elapsed
+        self.last_her_recent = her_recent
         if not self.verdicts:
             return None
         return self.verdicts.pop(0)
@@ -501,7 +503,7 @@ def test_main_streak_recheck() -> None:
 
     state.note_main("无奈")
     assert state.streak_of("害羞") == 0 and state.streak_of("无奈") == 1
-    assert "连续三轮以上当主" in appraisal_model.SYSTEM, "提示词里要有复核规则"
+    assert "已连续 N 轮为主" in appraisal_model.SYSTEM, "提示词里要有复核规则（状态行标了才复核）"
 
 
 def test_state_line_shows_trend() -> None:
@@ -570,7 +572,7 @@ def test_judge_prompt_covers_taxonomy() -> None:
                        ("REBUILD_SYSTEM", appraisal_model.REBUILD_SYSTEM)):
         missing = [key for key in taxonomy.EMOTIONS if key not in text]
         assert not missing, f"{name} 里漏了新情绪：{missing}"
-    assert "惊讶是短情绪" in appraisal_model.SYSTEM, "惊讶要提醒它短，但降多少由模型判断"
+    # 惊讶"很短"那句被删了：真正主干是"降不降由你判断"，等于没说；退场由第 5 条（按证据收）管。
     # 宿主用的是 json_object，模型服务要求提示词里必须出现 json 字样，否则直接 400。
     assert "json" in appraisal_model.BASELINE_SYSTEM.lower(), "性格概括的提示词必须提到 json"
     assert "json" in appraisal_model.SYSTEM.lower()
@@ -578,14 +580,75 @@ def test_judge_prompt_covers_taxonomy() -> None:
     assert "不要按字面直译" in appraisal_model.SYSTEM, "要有跨语言语境规则"
     assert "不要按字面直译" in appraisal_model.REBUILD_SYSTEM
     # 欣慰 / 温柔 / 撒娇 的边界
-    assert "欣慰是看到他好" in appraisal_model.SYSTEM
+    assert "欣慰 = 看到他好" in appraisal_model.SYSTEM
     # 撒娇 / 傲娇 是按行为区分的两种情绪，而且互斥
     assert "撒娇 = 行为" in appraisal_model.SYSTEM
     assert "傲娇 = 行为" in appraisal_model.SYSTEM
-    assert "不能同时超过 40" in appraisal_model.SYSTEM
+    # 撒娇和傲娇不再互斥：一句「才不要」接着又要人留下，就是两样都有。
+    assert "这两根可以同时有" in appraisal_model.SYSTEM, "行为可以并行，不要写成互斥"
     assert "85 以上" in appraisal_model.SYSTEM and "85 以上" in appraisal_model.RECHECK_SYSTEM, "高位要收"
-    assert "不能同时高于 40" in appraisal_model.REBUILD_SYSTEM
+    # 判定不能是一张「看到什么就给什么」的关键词表：入口必须是她的处境，不是他的用词。
+    assert "她自己在哪里" in appraisal_model.SYSTEM, "每根非零的弦都要能指出她自己在哪里"
+    assert "刺激不是反应" in appraisal_model.SYSTEM
+    assert "不写「什么情况就给」" in appraisal_model.SYSTEM, "词典只写是什么，不写什么时候给"
+    for name, text in (("SYSTEM", appraisal_model.SYSTEM),
+                       ("REBUILD_SYSTEM", appraisal_model.REBUILD_SYSTEM),
+                       ("RECHECK_SYSTEM", appraisal_model.RECHECK_SYSTEM)):
+        assert "->" not in text, f"{name} 里又出现了「情况 -> 数值」的表格行"
+    assert "不超过 40" in appraisal_model.RECHECK_SYSTEM, "校正要能推翻猜测，不能卡在 25"
+    assert "又气又怕都是真的" in appraisal_model.REBUILD_SYSTEM, "矛盾的两根要允许同时在场"
     assert "不按时间衰减" in appraisal_model.SYSTEM, "总原则里要写死：不按时间衰减"
+
+
+def test_judge_prompt_carries_her_own_words() -> None:
+    """先判跑在她开口之前：只给他的一句话，判断就只能查表。她前几轮的原话要能递进去。
+
+    这是判定退化成关键词表的根源——手里没有"她"，只能从他的话里找词。
+    """
+
+    text = appraisal_model.build_user_prompt(
+        user_text="我最近和一个 AI 聊得挺开心的",
+        reply_text="",
+        state_line="",
+        summary="",
+        elapsed="刚刚",
+        character_name="Sakura",
+        persona="她冷静克制。",
+        her_recent="[平静] 你回来了。 / [害羞] 我等了你一会儿。",
+    )
+    assert "她前几轮自己说的" in text, text
+    assert "我等了你一会儿" in text
+    assert text.index("她前几轮自己说的") < text.index("用户说："), "她的原话要排在他这句之前"
+    bare = appraisal_model.build_user_prompt(
+        user_text="在吗", reply_text="", state_line="", summary="", elapsed="", character_name="Sakura",
+    )
+    assert "她前几轮自己说的" not in bare, "没有内容时不要留一个空标题"
+
+
+def test_judge_ahead_reads_her_last_lines() -> None:
+    """先判必须看得见她上一轮说了什么，否则「证据」只可能来自他的用词。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-herwords-"))
+    try:
+        clock = Clock(21_000_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "h0", "kind": "human", "payload": {"text": "今天好累"}},
+            {"turnId": "h0", "kind": "assistant", "payload": {"segments": [
+                {"text": "那先坐下。", "tone": "温柔"},
+                {"text": "……水在桌上。", "tone": "害羞"},
+            ]}},
+            {"turnId": "h1", "kind": "human", "payload": {"text": "我回来了"}},
+        ]
+        appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 5})])
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("我回来了", "h1"))
+        assert appraiser.calls >= 1
+        assert "水在桌上" in appraiser.last_her_recent, appraiser.last_her_recent
+        assert "[温柔]" in appraiser.last_her_recent, "语气也是证据"
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_residual_not_expressed() -> None:
@@ -1650,6 +1713,8 @@ def main() -> int:
     cases = [
         ("情绪清单：二十六种", test_taxonomy),
         ("判定提示词覆盖每一种", test_judge_prompt_covers_taxonomy),
+        ("判定：她的原话进得去", test_judge_prompt_carries_her_own_words),
+        ("判定：先判看得见她", test_judge_ahead_reads_her_last_lines),
         ("提示词：主·次·辅", test_mood_roles),
         ("判断：上一轮至今量对了", test_elapsed_measures_real_gap),
         ("判断：能看到涨落趋势", test_state_line_shows_trend),

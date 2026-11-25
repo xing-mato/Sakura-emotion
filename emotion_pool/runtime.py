@@ -38,7 +38,7 @@ MEMORY_CTX_TTL = 480.0
 MAX_REPLY_CHARS = 600
 HISTORY_MAX_BYTES = 2 * 1024 * 1024
 HISTORY_RECORD_CHARS = 4000
-PLUGIN_VERSION = "1.0.0-beta.7"
+PLUGIN_VERSION = "1.0.0-beta.8"
 
 # 先判后答：判断在她说之前跑，所以要给一个硬上限。超时就用当前状态回答，
 # 不能因为判断慢而卡住对话——超时后那次调用自己跑完也没关系，结果直接丢掉。
@@ -305,6 +305,39 @@ class EmotionRuntime:
         except Exception as error:  # noqa: BLE001
             self._log("debug", "回复没能补进判断记录", {"error_type": type(error).__name__})
 
+    def _recent_her(self, *, rounds: int = 2, per_round: int = 3) -> str:
+        """她前几轮自己说的话（带语气）。
+
+        先判跑在她开口之前。如果只给她一个数字状态行和他这一句话，判断器手上就没有"她"——
+        能拿来做依据的只剩他的用词，判断必然退化成关键词表（他说了别的女孩，就该吃醋）。
+        把她说过的原话递过去，证据才有地方落。
+        """
+
+        blocks: list[str] = []
+        for entry in reversed(self._entries(12)):
+            if len(blocks) >= max(1, rounds):
+                break
+            if str(entry.get("kind") or "") != "assistant":
+                continue
+            payload = entry.get("payload")
+            items = payload.get("segments") if isinstance(payload, Mapping) else None
+            if not isinstance(items, list):
+                continue
+            parts: list[str] = []
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                # 宿主时间线里的段落文本在 "text" 上，不是 ja/zh（和回复校正同一条坑）。
+                spoken = item.get("zh") or item.get("text") or item.get("ja") or ""
+                body = " ".join(str(spoken).split())[:60]
+                if not body:
+                    continue
+                tone = " ".join(str(item.get("tone") or "").split())[:6]
+                parts.append(f"[{tone}] {body}" if tone else body)
+            if parts:
+                blocks.append(" / ".join(parts[-max(1, per_round):]))
+        return "\n".join(reversed(blocks))[:600]
+
     def _reply_segments(self, turn_id: str) -> list[dict[str, Any]]:
         """把她这一轮的回复拆成段（每段带语气标签）。"""
 
@@ -535,6 +568,8 @@ class EmotionRuntime:
         settings = self._settings()
         if not settings.enabled:
             return
+        # 她前几轮的原话：先判手上不能只有"他这一句"，否则所谓判断只能是查表。
+        her_recent = self._recent_her()
         with self._lock:
             state = self._state(character_id)
             # 「上一轮至今」要量的是「距上一轮结束多久」，不是「这次生成了几秒」。
@@ -561,6 +596,7 @@ class EmotionRuntime:
                         elapsed=_elapsed(max(0.0, gap_seconds)),
                         character_name=character_name,
                         persona=self._persona(character_id),
+                        her_recent=her_recent,
                         ),
                         self._samples,
                     )
