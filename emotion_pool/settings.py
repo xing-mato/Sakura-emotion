@@ -26,7 +26,13 @@ MEMORY_OPTIONS = (
     ("read_write", "读写 · 两边都接上"),
 )
 
-EDITABLE_KEYS = ("enabled", "detail", "memory_mode", "episode_keep")
+EDITABLE_KEYS = ("enabled", "detail", "memory_mode", "episode_keep", "samples", "thinking")
+# 判断模型要不要"想"。思考型模型会把预算全花在推理上：qwen3.7-flash 实测一次判断
+# 想 2,304 个 token、27 秒，而先判只等 15 秒——等于每轮都白跑。
+# 只影响情绪判断用的那个模型，聊天模型不归这里管。
+# 同一轮判断采几份取平均。3 份能压掉抖动，但一轮就是 3 次模型调用；
+# 1 份最省，代价是同样一句话可能判出不一样的分。
+SAMPLE_OPTIONS = ((1, "1 份（最省）"), (2, "2 份"), (3, "3 份（最稳）"))
 
 MAX_EPISODES = 40
 
@@ -67,6 +73,8 @@ class Settings:
     detail: str = "standard"
     memory_mode: str = "off"
     episode_keep: int = 16
+    samples: int = 1
+    thinking: bool = False   # False = 关掉思考（默认）；True = 让它想
 
     @property
     def memory_read(self) -> bool:
@@ -82,6 +90,8 @@ class Settings:
             "detail": self.detail,
             "memory_mode": self.memory_mode,
             "episode_keep": int(self.episode_keep),
+            "samples": int(self.samples),
+            "thinking": bool(self.thinking),
         }
 
     def normalized(self) -> dict[str, Any]:
@@ -96,6 +106,8 @@ def parse(values: object) -> Settings:
         detail=_as_choice(raw.get("detail"), defaults.detail, DETAIL_OPTIONS),
         memory_mode=_as_choice(raw.get("memory_mode"), defaults.memory_mode, MEMORY_OPTIONS),
         episode_keep=_as_int(raw.get("episode_keep"), defaults.episode_keep, 0, MAX_EPISODES),
+        samples=_as_int(raw.get("samples"), defaults.samples, 1, 3),
+        thinking=_as_bool(raw.get("thinking"), defaults.thinking),
     )
 
 
@@ -141,6 +153,24 @@ def descriptor() -> dict[str, Any]:
                 "maximum": MAX_EPISODES,
                 "unit": "条",
                 "description": "「哪句话让她动了多少」的记录，喂给下一轮的连续感，也在下面的记录表里能看到。0 = 不记录。",
+                "enabledWhen": enabled_when,
+            },
+            {
+                "key": "samples",
+                "label": "每轮判断采几份",
+                "type": "select",
+                "default": 1,
+                "options": [{"value": value, "label": label} for value, label in SAMPLE_OPTIONS],
+                "description": "同一轮并发判断几次取平均。份数越多越稳，也越贵——一轮里每一份都是一次模型调用。",
+                "enabledWhen": enabled_when,
+            },
+            {
+                "key": "thinking",
+                "label": "让判断模型先“想”一遍",
+                "type": "boolean",
+                "default": False,
+                "description": "只管情绪判断用的那个模型，不影响聊天模型。"
+                               "思考型模型会把预算花在推理上，一次判断几十秒，而先判只等 15 秒。关掉更快。",
                 "enabledWhen": enabled_when,
             },
             {

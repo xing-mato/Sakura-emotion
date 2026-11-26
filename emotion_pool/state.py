@@ -19,9 +19,13 @@ from . import taxonomy
 
 PRESENCE = 0.05          # 表现线：低于 5% 不占主·次·辅，也不进提示词主句
 FLOOR = 0.01             # 保留线：低于 1% 才算幽灵值，清零
+# 余韵线：不表现的东西，值不能比表现的东西还重。
+# 以前没有这条线，于是会出现「余韵：无奈 40%（有数值，但不表现）」——
+# 一个 40% 的情绪不可能不表现，说得通的做法只有两种：进前三，或者压到 15% 以下。
+RESIDUAL_CAP = 0.15
 # 两条线为什么要分开：余韵的定义是"有数值但不表现"，如果它和表现线同一条，
 # 余韵里就只装得下 ≥5% 的值，1~4% 的小反应会被直接抹掉——情绪就永远起不来。
-# 现在：≥5% 表现为主·次·辅；1~5% 留在余韵；<1% 清零。
+# 现在：≥5% 表现为主·次·辅；名册外的（1~15%）留在余韵；<1% 清零。
 # 人的情绪结构：一根主、最多一根次、偶尔一点辅。
 # 这三根是**表现层**——她会真的用它们说话。
 #
@@ -116,9 +120,12 @@ class Applied(dict):
     面板和涟漪都不该把它当情绪事件。
     """
 
-    def __init__(self, values: object = None, *, evicted: object = ()) -> None:
+    def __init__(self, values: object = None, *, evicted: object = (), capped: object = ()) -> None:
         super().__init__(values or {})
+        # evicted：被挤出六个名额、整根清零的
         self.evicted = list(evicted or ())
+        # capped：进了余韵但值太高，被压到余韵线上的
+        self.capped = list(capped or ())
 
 
 @dataclass
@@ -201,15 +208,26 @@ class CharacterState:
             if key not in names:
                 names.append(key)
         names = sorted(dict.fromkeys(names), key=lambda key: after.get(key, 0.0), reverse=True)
-        keep = set(names[:MAX_TRACKED])
+        ranked = names[:MAX_TRACKED]
+        # 前三个名额是「表现」，其余是「余韵」。
+        # 余韵的定义是"有数值但不表现"，所以它不能比表现的还重：超了 RESIDUAL_CAP 就压下来。
+        # 反过来，余韵涨进前三时，被挤下去的那根落进余韵——余韵满员时丢掉最小的那根，
+        # 名额始终是 3 + 3，不会溢出。
+        expressed = [key for key in ranked if after.get(key, 0.0) >= PRESENCE][:MAX_MOOD]
+        shown = set(expressed)
+        residual = [key for key in ranked if key not in shown][:MAX_MOOD]
+        keep = shown | set(residual)
 
         evicted = [
             key for key in taxonomy.EMOTIONS
             if before.get(key, 0.0) >= PRESENCE and key not in keep
         ]
+        capped = [key for key in residual if after.get(key, 0.0) > RESIDUAL_CAP]
         applied: dict[str, float] = {}
         for key in taxonomy.EMOTIONS:
             value = after.get(key, 0.0) if key in keep else 0.0
+            if key in residual and value > RESIDUAL_CAP:
+                value = RESIDUAL_CAP
             # 低于保留线的值既不进面板也不进提示词，留着只会占掉名额，
             # 形成「状态里有、界面没有、判断器也看不到」的幽灵值——直接清掉。
             # 1~5% 不算幽灵：它在余韵里，面板抽屉看得见。
@@ -219,7 +237,7 @@ class CharacterState:
             diff = round((value - before.get(key, 0.0)) * 100.0, 2)
             if abs(diff) >= 0.01:
                 applied[key] = diff
-        return Applied(applied, evicted=evicted)
+        return Applied(applied, evicted=evicted, capped=capped)
 
     def set_values(self, values: Mapping[str, float]) -> dict[str, float]:
         """绝对值写入（刷新用）：只改传进来的那几根，返回实际变化了多少个点。
@@ -368,8 +386,14 @@ class CharacterState:
         for key in taxonomy.EMOTIONS:
             values[key] = clamp_value(raw_values.get(key))
         # 旧存档可能同时挂着十几根弦：读进来先按容量收口（表现三根 + 余韵三根）
-        for key, _value in sorted(values.items(), key=lambda item: item[1], reverse=True)[MAX_TRACKED:]:
+        ranked = sorted(values.items(), key=lambda item: item[1], reverse=True)
+        for key, _value in ranked[MAX_TRACKED:]:
             values[key] = 0.0
+        # 余韵线上限也要在读取时生效：旧存档里可能挂着一根 40% 的"不表现"。
+        shown = {key for key, value in ranked[:MAX_MOOD] if value >= PRESENCE}
+        for key, value in ranked:
+            if key not in shown and value > RESIDUAL_CAP:
+                values[key] = RESIDUAL_CAP
         episodes = []
         if isinstance(data.get("episodes"), list):
             episodes = [Episode.from_dict(item) for item in data["episodes"]]
@@ -431,7 +455,7 @@ def describe(state: CharacterState) -> dict[str, Any]:
         ],
         # 余韵：有数值、但不会成为主句里的情绪，只当底色
         "residual": [
-            {"key": key, "value": value, "level": state.level_of(value)}
+            {"key": key, "value": min(value, RESIDUAL_CAP), "level": state.level_of(min(value, RESIDUAL_CAP))}
             for key, value in ranked if key not in shown
         ][:MAX_MOOD],
         "summary": state.summary,
@@ -441,5 +465,5 @@ def describe(state: CharacterState) -> dict[str, Any]:
 __all__ = [
     "CharacterState", "EPISODE_MIN_DELTA", "Episode", "LEVEL_THRESHOLDS", "MAX_MOOD",
     "MAX_PERCENT", "MAX_TRACKED", "MOOD_ROLES", "PENDING_LIMIT", "PENDING_TTL", "PRESENCE",
-    "FLOOR", "clamp_value", "describe", "percent_of",
+    "FLOOR", "RESIDUAL_CAP", "clamp_value", "describe", "percent_of",
 ]

@@ -23,12 +23,14 @@ try:  # 正常：作为包的一部分加载
     from .emotion_pool import settings as settings_module
     from .emotion_pool.appraisal_model import ModelAppraiser
     from .emotion_pool.memory_bridge import MemoryBridge
+    from .emotion_pool.model_slot import ModelSlot
     from .emotion_pool.runtime import EmotionRuntime
     from .emotion_pool.store import StateStore
 except ImportError:  # entry: plugin:EmotionPoolPlugin，按顶层模块加载
     from emotion_pool import settings as settings_module
     from emotion_pool.appraisal_model import ModelAppraiser
     from emotion_pool.memory_bridge import MemoryBridge
+    from emotion_pool.model_slot import ModelSlot
     from emotion_pool.runtime import EmotionRuntime
     from emotion_pool.store import StateStore
 
@@ -85,9 +87,21 @@ class EmotionPoolPlugin:
             return prompt if isinstance(prompt, str) else ""
 
         store = StateStore(context.data_path("state.json"), logger=logger)
+        # 判断可以用单独的模型：登记一个 plugin 槽，让它出现在设置 → 模型里。
+        # 没配就沿用对话模型，所以这一步失败也不影响插件。
+        model_slot = None
+        try:
+            model_slot = ModelSlot(context.data_path("model_slot.json"), logger=logger)
+            model_slot.register(context)
+        except Exception as error:  # noqa: BLE001
+            _warn(logger, "判断模型的槽没能登记，判断沿用对话模型", error)
         appraiser = None
         try:
-            appraiser = ModelAppraiser(context, logger=logger)
+            appraiser = ModelAppraiser(
+                context, logger=logger,
+                own_reference=(model_slot.reference if model_slot is not None else None),
+                thinking_mode=lambda: get_settings().thinking,
+            )
         except Exception as error:  # noqa: BLE001
             _warn(logger, "模型校正器没能建立，只做关键词快评", error)
         memory = None
@@ -119,6 +133,7 @@ class EmotionPoolPlugin:
             "provider": PROVIDER_ID,
             "state_file": runtime.saved_text(),
             "timeline": timeline is not None,
+            "judge_model": (appraiser.slot_label() if appraiser is not None else "") or "chat 槽",
         })
 
     def close(self) -> None:

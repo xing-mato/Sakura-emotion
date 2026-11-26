@@ -27,7 +27,7 @@ for _stream in (sys.stdout, sys.stderr):
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from emotion_pool import appraisal_model, prompt, settings as settings_module  # noqa: E402
+from emotion_pool import appraisal_model, model_slot, prompt, settings as settings_module  # noqa: E402
 from emotion_pool import state as state_module  # noqa: E402
 from emotion_pool import taxonomy  # noqa: E402
 from emotion_pool.memory_bridge import MemoryBridge  # noqa: E402
@@ -144,6 +144,8 @@ class FakeContext:
         self.events: dict[str, list] = {}
         self.holders: dict[str, dict] = {}
         self.slots: dict[str, Any] = {}
+        # 同一个槽实例要复用：宿主里它是有状态的注册表，每次 get 都新建就看不到登记
+        self.model_slots = _ModelSlots(self.slots)
         self.timeline = timeline or FakeTimeline()
         self.character = character or FakeCharacter()
         if catalog is not None:
@@ -161,7 +163,7 @@ class FakeContext:
         if key == "sakura.host.tools":
             return FakeRegistrationProxy(self.holders.setdefault("sakura.host.tools", {}), "tools")
         if key == "sakura.host.model_slots.v2":
-            return _ModelSlots(self.slots)
+            return self.model_slots
         if key == "sakura.host.timeline":
             return self.timeline
         if key == "sakura.host.character":
@@ -183,9 +185,15 @@ class FakeContext:
 class _ModelSlots:
     def __init__(self, slots: dict) -> None:
         self._slots = slots
+        self.registered: dict[str, dict] = {}
 
     def active(self) -> dict:
         return dict(self._slots)
+
+    def register(self, descriptor, *, load, save) -> str:
+        slot_id = descriptor["slotId"]
+        self.registered[slot_id] = {"descriptor": dict(descriptor), "load": load, "save": save}
+        return "registration:" + slot_id
 
 
 # ---------------------------------------------------------------- 工具
@@ -280,16 +288,18 @@ class StubAppraiser:
         self.last_state_line = ""
         self.last_persona = ""
         self.last_elapsed = ""
+        self.last_her_recent = ""
 
     def available(self) -> bool:
         return True
 
     def appraise(self, *, user_text, reply_text, state_line="", summary="", elapsed="",
-                 character_name="", persona=""):
+                 character_name="", persona="", her_recent=""):
         self.calls += 1
         self.last_state_line = state_line
         self.last_persona = persona
         self.last_elapsed = elapsed
+        self.last_her_recent = her_recent
         if not self.verdicts:
             return None
         return self.verdicts.pop(0)
@@ -501,7 +511,7 @@ def test_main_streak_recheck() -> None:
 
     state.note_main("无奈")
     assert state.streak_of("害羞") == 0 and state.streak_of("无奈") == 1
-    assert "连续三轮以上当主" in appraisal_model.SYSTEM, "提示词里要有复核规则"
+    assert "已连续 N 轮为主" in appraisal_model.SYSTEM, "提示词里要有复核规则（状态行标了才复核）"
 
 
 def test_state_line_shows_trend() -> None:
@@ -570,7 +580,7 @@ def test_judge_prompt_covers_taxonomy() -> None:
                        ("REBUILD_SYSTEM", appraisal_model.REBUILD_SYSTEM)):
         missing = [key for key in taxonomy.EMOTIONS if key not in text]
         assert not missing, f"{name} 里漏了新情绪：{missing}"
-    assert "惊讶是短情绪" in appraisal_model.SYSTEM, "惊讶要提醒它短，但降多少由模型判断"
+    # 惊讶"很短"那句被删了：真正主干是"降不降由你判断"，等于没说；退场由第 5 条（按证据收）管。
     # 宿主用的是 json_object，模型服务要求提示词里必须出现 json 字样，否则直接 400。
     assert "json" in appraisal_model.BASELINE_SYSTEM.lower(), "性格概括的提示词必须提到 json"
     assert "json" in appraisal_model.SYSTEM.lower()
@@ -578,14 +588,174 @@ def test_judge_prompt_covers_taxonomy() -> None:
     assert "不要按字面直译" in appraisal_model.SYSTEM, "要有跨语言语境规则"
     assert "不要按字面直译" in appraisal_model.REBUILD_SYSTEM
     # 欣慰 / 温柔 / 撒娇 的边界
-    assert "欣慰是看到他好" in appraisal_model.SYSTEM
+    assert "欣慰 = 看到他好" in appraisal_model.SYSTEM
     # 撒娇 / 傲娇 是按行为区分的两种情绪，而且互斥
     assert "撒娇 = 行为" in appraisal_model.SYSTEM
     assert "傲娇 = 行为" in appraisal_model.SYSTEM
-    assert "不能同时超过 40" in appraisal_model.SYSTEM
+    # 撒娇和傲娇不再互斥：一句「才不要」接着又要人留下，就是两样都有。
+    assert "这两根可以同时有" in appraisal_model.SYSTEM, "行为可以并行，不要写成互斥"
     assert "85 以上" in appraisal_model.SYSTEM and "85 以上" in appraisal_model.RECHECK_SYSTEM, "高位要收"
-    assert "不能同时高于 40" in appraisal_model.REBUILD_SYSTEM
+    # 判定不能是一张「看到什么就给什么」的关键词表：入口必须是她的处境，不是他的用词。
+    assert "她自己在哪里" in appraisal_model.SYSTEM, "每根非零的弦都要能指出她自己在哪里"
+    assert "刺激不是反应" in appraisal_model.SYSTEM
+    assert "不写「什么情况就给」" in appraisal_model.SYSTEM, "词典只写是什么，不写什么时候给"
+    for name, text in (("SYSTEM", appraisal_model.SYSTEM),
+                       ("REBUILD_SYSTEM", appraisal_model.REBUILD_SYSTEM),
+                       ("RECHECK_SYSTEM", appraisal_model.RECHECK_SYSTEM)):
+        assert "->" not in text, f"{name} 里又出现了「情况 -> 数值」的表格行"
+    assert "不超过 40" in appraisal_model.RECHECK_SYSTEM, "校正要能推翻猜测，不能卡在 25"
+    assert "又气又怕都是真的" in appraisal_model.REBUILD_SYSTEM, "矛盾的两根要允许同时在场"
     assert "不按时间衰减" in appraisal_model.SYSTEM, "总原则里要写死：不按时间衰减"
+
+
+def test_judge_prompt_carries_her_own_words() -> None:
+    """先判跑在她开口之前：只给他的一句话，判断就只能查表。她前几轮的原话要能递进去。
+
+    这是判定退化成关键词表的根源——手里没有"她"，只能从他的话里找词。
+    """
+
+    text = appraisal_model.build_user_prompt(
+        user_text="我最近和一个 AI 聊得挺开心的",
+        reply_text="",
+        state_line="",
+        summary="",
+        elapsed="刚刚",
+        character_name="Sakura",
+        persona="她冷静克制。",
+        her_recent="[平静] 你回来了。 / [害羞] 我等了你一会儿。",
+    )
+    assert "她前几轮自己说的" in text, text
+    assert "我等了你一会儿" in text
+    assert text.index("她前几轮自己说的") < text.index("用户说："), "她的原话要排在他这句之前"
+    bare = appraisal_model.build_user_prompt(
+        user_text="在吗", reply_text="", state_line="", summary="", elapsed="", character_name="Sakura",
+    )
+    assert "她前几轮自己说的" not in bare, "没有内容时不要留一个空标题"
+
+
+def test_judge_ahead_reads_her_last_lines() -> None:
+    """先判必须看得见她上一轮说了什么，否则「证据」只可能来自他的用词。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-herwords-"))
+    try:
+        clock = Clock(21_000_000.0)
+        timeline = FakeTimeline()
+        timeline.entries = [
+            {"turnId": "h0", "kind": "human", "payload": {"text": "今天好累"}},
+            {"turnId": "h0", "kind": "assistant", "payload": {"segments": [
+                {"text": "那先坐下。", "tone": "温柔"},
+                {"text": "……水在桌上。", "tone": "害羞"},
+            ]}},
+            {"turnId": "h1", "kind": "human", "payload": {"text": "我回来了"}},
+        ]
+        appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 5})])
+        runtime = make_runtime(root, clock=clock, timeline=timeline, appraiser=appraiser)
+        runtime.fragment_for(turn_request("我回来了", "h1"))
+        assert appraiser.calls >= 1
+        assert "水在桌上" in appraiser.last_her_recent, appraiser.last_her_recent
+        assert "[温柔]" in appraiser.last_her_recent, "语气也是证据"
+        runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_model_slot_roundtrip() -> None:
+    """判断可以用单独的模型：槽里存什么就回什么，没存就返回 None（回落对话模型）。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-slot-"))
+    try:
+        slot = model_slot.ModelSlot(root / "model_slot.json", logger=FakeLogger())
+        assert slot.reference() is None, "没配过就该返回 None"
+        assert slot.load() == model_slot.EMPTY, slot.load()
+        result = slot.save({"serviceKey": "svc", "profileId": "p1", "modelId": "cheap-flash"})
+        assert result.get("applicationState") == "applied", result
+        ref = slot.reference()
+        assert ref == {"serviceKey": "svc", "profileId": "p1", "modelId": "cheap-flash"}, ref
+        # 清空之后要回到回落状态
+        slot.save({"serviceKey": "", "profileId": "", "modelId": ""})
+        assert slot.reference() is None
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_judge_prefers_own_slot() -> None:
+    """配了判断模型就用它；没配才用对话模型。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-slotref-"))
+    try:
+        context = FakeContext(root)
+        context.slots["chat"] = {"serviceKey": "svc", "profileId": "chatp", "modelId": "strong-model"}
+        own = {"serviceKey": "svc", "profileId": "judgep", "modelId": "cheap-model"}
+        appraiser = appraisal_model.ModelAppraiser(context, logger=FakeLogger(), own_reference=lambda: own)
+        assert appraiser.reference()["modelId"] == "cheap-model", appraiser.reference()
+        assert "cheap-model" in appraiser.slot_label()
+        bare = appraisal_model.ModelAppraiser(context, logger=FakeLogger())
+        assert bare.reference()["modelId"] == "strong-model", bare.reference()
+        # 槽里配了但缺字段 → 当作没配，回落到对话模型
+        half = appraisal_model.ModelAppraiser(
+            context, logger=FakeLogger(), own_reference=lambda: {"serviceKey": "svc"})
+        assert half.reference()["modelId"] == "strong-model"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_plugin_registers_judge_slot() -> None:
+    """插件启动时要把 judge 槽登记给宿主，设置 → 模型里才看得见。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-slotreg-"))
+    try:
+        import plugin as plugin_module
+        context = FakeContext(root)
+        plugin = plugin_module.EmotionPoolPlugin()
+        plugin.setup(context)
+        slots = context.get("sakura.host.model_slots.v2")
+        assert model_slot.SLOT_ID in slots.registered, slots.registered
+        entry = slots.registered[model_slot.SLOT_ID]
+        assert entry["descriptor"]["required"] is False, "可不填，不填就沿用对话模型"
+        assert entry["load"]() == model_slot.EMPTY
+        assert entry["save"]({"serviceKey": "s", "profileId": "p", "modelId": "m"})["applicationState"] == "applied"
+        assert (root / "model_slot.json").is_file()
+        plugin.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_residual_is_capped() -> None:
+    """余韵是「不表现」的，值就不能比表现的那几根还重——超了压到 15%。"""
+
+    state = state_module.CharacterState()
+    applied = state.apply_mood(
+        ["温柔", "欣慰", "好奇"],
+        {"温柔": 60, "欣慰": 50, "好奇": 45, "无奈": 40},
+    )
+    # 结局：四根都在场，只有前三能表现，无奈落进余韵——它 40%，压到 15
+    assert abs(state.values["无奈"] - state_module.RESIDUAL_CAP) < 1e-9, state.values["无奈"]
+    assert "无奈" in applied.capped, applied.capped
+    described = state_module.describe(state)
+    assert all(item["value"] <= state_module.RESIDUAL_CAP for item in described["residual"]), described["residual"]
+    text = prompt.build(state, settings_module.parse({}), time.time())
+    assert "余韵" in text and "无奈 15%" in text, text
+
+
+def test_residual_promotes_and_evicts_smallest() -> None:
+    """余韵涨进前三：被挤下去的那根落进余韵，六个名额自动腾挪，不会溢出。"""
+
+    state = state_module.CharacterState()
+    state.apply_mood(
+        ["温柔", "欣慰", "好奇"],
+        {"温柔": 40, "欣慰": 35, "好奇": 30, "期待": 10, "尴尬": 8, "平静": 6},
+    )
+    # 平静是第六根（余韵里最小的）
+    assert state.values["平静"] > 0
+    state.apply_mood(None, {"无奈": 60})
+    described = state_module.describe(state)
+    slots = [item["key"] for item in described["slots"]]
+    assert slots[0] == "无奈", slots
+    residual = {item["key"]: item["value"] for item in described["residual"]}
+    assert "好奇" in residual, residual
+    assert residual["好奇"] <= state_module.RESIDUAL_CAP, residual
+    assert len(residual) <= state_module.MAX_MOOD, residual
+    assert state.values["平静"] == 0, "名额满时丢掉余韵里最小的那根"
 
 
 def test_residual_not_expressed() -> None:
@@ -918,7 +1088,7 @@ def test_judge_averages_samples() -> None:
             appraisal_model.ModelVerdict(deltas={"温柔": 10, "无奈": 10}, summary="心软"),
             appraisal_model.ModelVerdict(deltas={"温柔": 20}, summary="被打动了"),
         ])
-        runtime = make_runtime(root, clock=clock, appraiser=appraiser, samples=3)
+        runtime = make_runtime(root, clock=clock, appraiser=appraiser, settings={"samples": 3})
         runtime.fragment_for(turn_request("我回来了", "avg1"))
         state = runtime._state("Sakura")
         assert appraiser.calls == 3, appraiser.calls
@@ -928,6 +1098,44 @@ def test_judge_averages_samples() -> None:
         runtime.close()
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_sample_count_is_configurable() -> None:
+    """每轮采几份可以在设置里改：1 份最省，3 份最稳。"""
+
+    root = Path(tempfile.mkdtemp(prefix="emotion-pool-samples2-"))
+    try:
+        clock = Clock(23_100_000.0)
+        for count, expect in ((1, 1), (2, 2), (3, 3)):
+            appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 10}) for _ in range(3)])
+            runtime = make_runtime(root, clock=clock, appraiser=appraiser, settings={"samples": count})
+            runtime.fragment_for(turn_request("在吗", "s" + str(count)))
+            assert appraiser.calls == expect, (count, appraiser.calls)
+            runtime.close()
+        # 越界的值要被夹回来，不能因为设置写错就一轮打十次模型
+        for raw, expect in ((0, 1), (9, 3), ("2", 2)):
+            appraiser = StubAppraiser([appraisal_model.ModelVerdict(deltas={"温柔": 10}) for _ in range(3)])
+            runtime = make_runtime(root, clock=clock, appraiser=appraiser, settings={"samples": raw})
+            runtime.fragment_for(turn_request("在吗", "c" + str(raw)))
+            assert appraiser.calls == expect, (raw, appraiser.calls)
+            runtime.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_thinking_off_for_reasoning_models() -> None:
+    """思考型模型要关掉思考：qwen 实测一次判断想 2,300 token、27 秒，先判只等 15 秒。"""
+
+    assert appraisal_model._thinking_off(False) == {"enable_thinking": False}
+    assert appraisal_model._thinking_off(True) is None
+    # 默认关着：新装的用户不该一上来就等 27 秒
+    assert settings_module.parse({}).thinking is False
+    assert settings_module.parse({"thinking": True}).thinking is True
+    assert settings_module.parse({"thinking": "on"}).thinking is True
+    assert settings_module.parse({"thinking": "乱写"}).thinking is False
+    # 这个开关只发给判断模型；appraiser 拿不到设置时按"关"处理
+    appraiser = appraisal_model.ModelAppraiser(FakeContext(Path(tempfile.mkdtemp())), logger=FakeLogger())
+    assert appraiser.thinking_enabled() is False
 
 
 def test_export_action_takes_no_values() -> None:
@@ -1650,6 +1858,11 @@ def main() -> int:
     cases = [
         ("情绪清单：二十六种", test_taxonomy),
         ("判定提示词覆盖每一种", test_judge_prompt_covers_taxonomy),
+        ("判定：她的原话进得去", test_judge_prompt_carries_her_own_words),
+        ("判定：先判看得见她", test_judge_ahead_reads_her_last_lines),
+        ("模型：判断可以单独设", test_model_slot_roundtrip),
+        ("模型：配了就用自己的", test_judge_prefers_own_slot),
+        ("模型：启动时登记槽", test_plugin_registers_judge_slot),
         ("提示词：主·次·辅", test_mood_roles),
         ("判断：上一轮至今量对了", test_elapsed_measures_real_gap),
         ("判断：能看到涨落趋势", test_state_line_shows_trend),
@@ -1662,6 +1875,8 @@ def main() -> int:
         ("池子：驱逐不算情绪变化", test_eviction_is_not_an_emotion),
         ("判断：主情绪久了要复核", test_main_streak_recheck),
         ("池子：表现三根 + 余韵三根", test_mood_capacity),
+        ("池子：余韵压到 15%", test_residual_is_capped),
+        ("池子：余韵升位、最弱的让位", test_residual_promotes_and_evicts_smallest),
         ("注入：余韵标着不表现", test_residual_not_expressed),
         ("状态行：刷新也要说清改了什么", test_status_last_shows_refresh_change),
         ("状态行：只写落地的变化", test_status_last_shows_landed_change),
@@ -1678,6 +1893,8 @@ def main() -> int:
         ("判断：先判超时不卡对话", test_judge_timeout_keeps_state),
         ("导出：一个动作、只出 JSONL", test_export_action_takes_no_values),
         ("判断：三份采样取平均", test_judge_averages_samples),
+        ("判断：采样份数可设置", test_sample_count_is_configurable),
+        ("判断：思考型模型关绕路", test_thinking_off_for_reasoning_models),
         ("面板：清零要带回新数据", test_reset_returns_payload),
         ("校正：按她的分段语气结算", test_recheck_uses_her_segments),
         ("校正：只有一段就跳过", test_recheck_skips_single_segment),
